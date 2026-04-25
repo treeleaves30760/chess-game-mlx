@@ -1,0 +1,40 @@
+[project]
+name = "chess-game-mlx-training"
+version = "0.1.0"
+description = "Training pipeline for Chess_Game_mlx (MLX + ChessBench + dlshogi)"
+requires-python = ">=3.12"
+
+dependencies = [
+    "mlx>=0.31.0",
+    "mlx-data>=0.1.0",
+    "numpy>=2.1",
+    "chess>=1.11",           # python-chess for data prep / PGN parsing
+    "safetensors>=0.4",
+    "tqdm>=4.66",
+    "click>=8.1",
+    "pyarrow>=18.0",         # parquet reading for ChessBench
+    "zstandard>=0.23",       # bagz compression
+    "python-shogi>=1.1",     # pure-Python shogi library for arm64 (cshogi pins -mavx2)
+    "onnxruntime>=1.25.0",   # run ONNX-exported LC0 nets (see training/lc0/onnx_runner.py)
+    "onnx>=1.21.0",          # introspect exported LC0 ONNX graphs
+]
+
+# cshogi 0.7.8 pins -mavx2 in setup.py and fails on arm64. Install from git when needed:
+#   uv add "cshogi @ git+https://github.com/TadaoYamaoka/cshogi@master"
+# or use the vendored C++ core directly and skip the Python binding.
+[project.optional-dependencies]
+shogi-python = [
+    # intentionally empty; see comment above — python-shogi is now a core dep
+]
+
+[project.scripts]
+chess-mlx-pretrain = "training.scripts.pretrain:main"
+chess-mlx-selfplay = "training.scripts.finetune_selfplay:main"
+chess-mlx-eval = "training.scripts.evaluate:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/training"]
