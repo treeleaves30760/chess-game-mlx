@@ -340,11 +340,21 @@ private:
                 ? (r.nodes * 1000ULL / std::max<std::uint64_t>(1, r.elapsed_ms))
                 : 0;
         for (int k = 0; k < multipv_n; ++k) {
+            const auto& pv = r.top_pvs[static_cast<std::size_t>(k)];
+            // Skip info lines with no PV — they carry no actionable best-move
+            // information and the GUI can't render an arrow for an empty PV
+            // (it ends up dropping the slot, which is what causes top-1 to
+            // vanish from the board during the first few MCTS iterations).
+            if (pv.empty()) continue;
             std::ostringstream oss;
             oss << "info";
             oss << " depth "    << std::max(1, r.seldepth);
             oss << " seldepth " << r.seldepth;
-            if (multipv_n > 1) oss << " multipv " << (k + 1);
+            // Always emit the multipv tag so each slot has a stable identity,
+            // even when only one PV exists. Without the tag, the parser
+            // defaults to multipv=1, which causes single-PV updates to
+            // clobber multi-PV state from earlier in the same search.
+            oss << " multipv " << (k + 1);
             const float stm_v = r.top_values[static_cast<std::size_t>(k)];
             const float white_v = root_stm_is_white_ ? stm_v : -stm_v;
             const int cp = value_to_cp(white_v);
@@ -353,7 +363,7 @@ private:
             oss << " nps "      << nps;
             oss << " time "     << r.elapsed_ms;
             oss << " pv";
-            for (const auto& m : r.top_pvs[static_cast<std::size_t>(k)]) {
+            for (const auto& m : pv) {
                 oss << " " << ProtocolTraits::move_to_string(m);
             }
             out_line(oss.str());
