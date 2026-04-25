@@ -8,6 +8,30 @@ if(NOT EXISTS ${CSHOGI_UPSTREAM}/bitboard.cpp)
                         "Did you run `git submodule update --init`?")
 endif()
 
+# --- Apply our local patches to the submodule on first configure ---
+# We don't modify the submodule's git state directly; instead, we apply each
+# .patch file under patches/ idempotently. The marker file `.patches_applied`
+# inside the submodule prevents re-application.
+set(CSHOGI_PATCH_MARKER ${CSHOGI_UPSTREAM}/../.patches_applied)
+if(NOT EXISTS ${CSHOGI_PATCH_MARKER})
+    file(GLOB _CSHOGI_PATCHES "${CMAKE_CURRENT_LIST_DIR}/patches/*.patch")
+    foreach(_patch ${_CSHOGI_PATCHES})
+        message(STATUS "cshogi_core: applying ${_patch}")
+        execute_process(
+            COMMAND patch -p1 -i ${_patch}
+            WORKING_DIRECTORY ${CSHOGI_UPSTREAM}/..
+            RESULT_VARIABLE _rc
+            OUTPUT_VARIABLE _out
+            ERROR_VARIABLE _err
+        )
+        if(NOT _rc EQUAL 0)
+            message(FATAL_ERROR
+                "Failed to apply ${_patch}:\n${_out}\n${_err}")
+        endif()
+    endforeach()
+    file(WRITE ${CSHOGI_PATCH_MARKER} "applied\n")
+endif()
+
 # Only the files needed for Position + move generation + hand pieces + USI parsing.
 # Excluded: book.cpp, dfpn.cpp, mate.cpp, search.cpp (engine search we replace).
 # usi.cpp is included: it provides usiToMove() used by our shogi/usi.hpp wrappers.

@@ -1,0 +1,16 @@
+diff --git a/src/square.hpp b/src/square.hpp
+index 82a4a85..f2cfbde 100644
+--- a/src/square.hpp
++++ b/src/square.hpp
+@@ -287,7 +287,10 @@ inline bool isOpponentField(const Color c, const Rank r) {
+ // bit 24..28 : いまの升から盤外まで何升左に(略
+ enum SquareWithWall : int32_t {
+     // 相対移動するときの差分値
+-    SQWW_R = DeltaE - (1 << 9) + (1 << 24), SQWW_U = DeltaN - (1 << 14) + (1 << 19), SQWW_D = -int(SQWW_U), SQWW_L = -int(SQWW_R),
++    // Note: DeltaE=(-9), DeltaN=(-1) are written as raw int literals here to
++    // avoid calling constexpr operator-(SquareDelta, int) with an out-of-range
++    // result, which Apple Clang 21+ rejects even in C++11 mode (CWG2518).
++    SQWW_R = (-9) - (1 << 9) + (1 << 24), SQWW_U = (-1) - (1 << 14) + (1 << 19), SQWW_D = -int(SQWW_U), SQWW_L = -int(SQWW_R),
+     SQWW_RU = int(SQWW_R) + int(SQWW_U), SQWW_RD = int(SQWW_R) + int(SQWW_D), SQWW_LU = int(SQWW_L) + int(SQWW_U), SQWW_LD = int(SQWW_L) + int(SQWW_D),
+ 
+     // SQ_11の地点に対応する値(他の升はこれ相対で事前に求めテーブルに格納)
