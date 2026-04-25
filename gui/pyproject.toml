@@ -1,0 +1,24 @@
+[project]
+name = "chess-game-mlx-gui"
+version = "0.1.0"
+description = "Pygame GUI for Chess_Game_mlx"
+requires-python = ">=3.12"
+
+dependencies = [
+    "pygame>=2.6",
+    "chess>=1.11",
+    "click>=8.1",
+]
+
+# cshogi (Python binding for shogi) is optional; install manually from git if needed:
+#   uv add --package chess-game-mlx-gui "cshogi @ git+https://github.com/TadaoYamaoka/cshogi@master"
+
+[project.scripts]
+chess-mlx-gui = "gui.app:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gui"]
