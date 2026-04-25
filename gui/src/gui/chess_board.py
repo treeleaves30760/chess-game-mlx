@@ -330,6 +330,13 @@ class ChessBoardRenderer(BoardRenderer):
             return f"#-M{(32000 + cp) // 2 + 1}"
         return f"{cp / 100:+.2f}"
 
+    # Badge corner anchor by rank: each rank occupies a different corner of
+    # the destination square so when multiple arrows share a target square
+    # (e.g. top-1 and top-2 both pointing to e4) the badges don't stack on
+    # top of each other and obscure each other. Rank 4+ (rare) reuses the
+    # bottom-left corner.
+    _BADGE_CORNERS: tuple[str, ...] = ("TL", "TR", "BR", "BL")
+
     def _draw_arrow_label(
         self,
         overlay: pygame.Surface,
@@ -348,11 +355,25 @@ class ChessBoardRenderer(BoardRenderer):
         pad_x, pad_y = 4, 2
         bg_w = tw + pad_x * 2
         bg_h = th + pad_y * 2
+        margin = 2
 
-        # Anchor the badge at the top-left of the destination square so it doesn't
-        # cover the piece glyph sitting in the centre. Clamp to overlay bounds.
-        bx = cx - sq // 2 + 2
-        by = cy - sq // 2 + 2
+        # Pick a corner of the destination square based on rank so different
+        # arrows targeting the same square don't collide.
+        corner = self._BADGE_CORNERS[(arrow.rank - 1) % len(self._BADGE_CORNERS)]
+        if corner == "TL":
+            bx = cx - sq // 2 + margin
+            by = cy - sq // 2 + margin
+        elif corner == "TR":
+            bx = cx + sq // 2 - margin - bg_w
+            by = cy - sq // 2 + margin
+        elif corner == "BR":
+            bx = cx + sq // 2 - margin - bg_w
+            by = cy + sq // 2 - margin - bg_h
+        else:  # BL
+            bx = cx - sq // 2 + margin
+            by = cy + sq // 2 - margin - bg_h
+
+        # Clamp to overlay bounds in case the destination is at a board edge.
         bx = max(0, min(bx, overlay.get_width() - bg_w))
         by = max(0, min(by, overlay.get_height() - bg_h))
 
