@@ -12,7 +12,7 @@ endif()
 # We don't modify the submodule's git state directly; instead, we apply each
 # .patch file under patches/ idempotently. The marker file `.patches_applied`
 # inside the submodule prevents re-application.
-set(CSHOGI_PATCH_MARKER ${CSHOGI_UPSTREAM}/../.patches_applied)
+set(CSHOGI_PATCH_MARKER ${CMAKE_CURRENT_LIST_DIR}/.patches_applied)
 if(NOT EXISTS ${CSHOGI_PATCH_MARKER})
     file(GLOB _CSHOGI_PATCHES "${CMAKE_CURRENT_LIST_DIR}/patches/*.patch")
     foreach(_patch ${_CSHOGI_PATCHES})

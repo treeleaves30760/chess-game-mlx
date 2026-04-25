@@ -57,3 +57,4 @@ compile_commands.json
 
 # Test outputs
 golden_data/generated/
+.claude/
