@@ -1,0 +1,9 @@
+[submodule "engine/third_party/chess-library"]
+	path = engine/third_party/chess-library
+	url = https://github.com/Disservin/chess-library.git
+[submodule "engine/third_party/mlx-c"]
+	path = engine/third_party/mlx-c
+	url = https://github.com/ml-explore/mlx-c.git
+[submodule "engine/third_party/cshogi-upstream"]
+	path = engine/third_party/cshogi-upstream
+	url = https://github.com/TadaoYamaoka/cshogi.git

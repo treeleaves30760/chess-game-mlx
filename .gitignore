@@ -1,0 +1,59 @@
+# Build
+build/
+cmake-build-*/
+*.o
+*.obj
+*.a
+*.dylib
+*.so
+engine/bin/*
+!engine/bin/.gitkeep
+
+# Python / uv
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.tox/
+dist/
+build-py/
+
+# MLX / model artifacts
+*.safetensors
+*.npz
+checkpoints/
+runs/
+
+# Data (large, downloaded)
+data/chessbench/*
+!data/chessbench/.gitkeep
+data/dlshogi/*
+!data/dlshogi/.gitkeep
+data/lc0_nets/*
+!data/lc0_nets/.gitkeep
+data/*.npz
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+.cache/
+
+# Project temp
+/tmp/
+*.log
+nohup.out
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Test outputs
+golden_data/generated/

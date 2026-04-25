@@ -1,0 +1,42 @@
+MIT License for Chess_Game_mlx core code
+
+Copyright (c) 2026 treeleaves30760
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------
+THIRD-PARTY NOTICES — IMPORTANT FOR shogi_engine
+
+The `engine/bin/shogi_engine` binary links the vendored cshogi C++ core
+(`engine/third_party/cshogi-upstream/`, `engine/third_party/cshogi_core/`),
+which is derived from Apery (itself derived from Stockfish) and licensed
+under **GNU GPL v3**. Binary distributions of shogi_engine therefore inherit
+GPL v3 obligations. See cshogi-upstream/LICENSE for full terms.
+
+The chess_engine binary, training pipeline, GUI, and non-shogi headers
+link only against:
+  - Disservin/chess-library (MIT)
+  - ml-explore/mlx + ml-explore/mlx-c (MIT)
+  - nlohmann/json (MIT)
+  - python-chess, pygame, mlx (all permissive)
+and are therefore MIT-only.
+
+If you plan to redistribute shogi_engine, ensure compliance with GPL v3.
+If you need a non-GPL shogi engine, substitute a non-GPL move generator
+(e.g. write from scratch or use a permissively-licensed alternative).

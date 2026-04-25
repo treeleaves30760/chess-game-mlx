@@ -1,0 +1,51 @@
+[project]
+name = "chess-game-mlx"
+version = "0.1.0"
+description = "Chess + Shogi AI for Apple Silicon using MLX"
+requires-python = ">=3.12"
+readme = "README.md"
+authors = [{ name = "treeleaves30760", email = "treeleaves30760@gmail.com" }]
+
+# Root package is an aggregator; real code lives in training/ and gui/.
+dependencies = [
+    "chess-game-mlx-training",
+    "chess-game-mlx-gui",
+    "onnxruntime>=1.25.0",
+    "onnx>=1.21.0",
+    "python-chess>=1.999",
+    "numpy>=2.4.4",
+]
+
+[tool.uv.sources]
+chess-game-mlx-training = { workspace = true }
+chess-game-mlx-gui = { workspace = true }
+
+[tool.uv.workspace]
+members = ["training", "gui"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-xdist>=3.6",
+    "ruff>=0.7",
+    "mypy>=1.12",
+]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "PL", "RUF"]
+ignore = ["PLR0913", "PLR2004"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_ignores = true
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-markers --import-mode=importlib"
+testpaths = ["training/tests", "gui/tests"]
+pythonpath = ["."]
+
