@@ -60,6 +60,32 @@ def cosine_lr_with_warmup(
     return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * cosine)
 
 
+def wsd_lr(
+    step: int,
+    total_steps: int,
+    base_lr: float,
+    warmup_steps: int = 2500,
+    decay_frac: float = 0.20,
+    min_lr_ratio: float = 0.0,
+) -> float:
+    """Warmup-Stable-Decay schedule.
+
+    Linear warmup → flat at ``base_lr`` → linear decay over the last
+    ``decay_frac`` of training. Originally proposed for LLM pretraining
+    (e.g. MiniCPM, DeepSeek) — the long stable phase tends to outperform
+    cosine for fixed compute budgets, and the linear tail allows clean
+    annealing-then-restart for continued training.
+    """
+    decay_steps = max(1, int(total_steps * decay_frac))
+    decay_start = total_steps - decay_steps
+    if step < warmup_steps:
+        return base_lr * (step + 1) / warmup_steps
+    if step < decay_start:
+        return base_lr
+    progress = (step - decay_start) / decay_steps
+    return base_lr * (min_lr_ratio + (1.0 - min_lr_ratio) * (1.0 - progress))
+
+
 # ---------------------------------------------------------------------------
 # Trainer
 # ---------------------------------------------------------------------------
@@ -96,6 +122,8 @@ class SupervisedTrainer:
         w_policy: float = 1.0,
         w_value: float = 1.0,
         w_moves_left: float = 0.1,
+        schedule: Literal["cosine", "wsd"] = "cosine",
+        wsd_decay_frac: float = 0.20,
     ) -> None:
         self.model = model
         self.game = game
@@ -109,6 +137,8 @@ class SupervisedTrainer:
         self.w_policy = w_policy
         self.w_value = w_value
         self.w_moves_left = w_moves_left
+        self.schedule = schedule
+        self.wsd_decay_frac = wsd_decay_frac
 
         self.step = 0
         self.history: list[dict[str, float]] = []
@@ -163,9 +193,16 @@ class SupervisedTrainer:
             Dictionary with loss components as Python floats.
         """
         # Update LR
-        current_lr = cosine_lr_with_warmup(
-            self.step, self.total_steps, self.base_lr, self.warmup_steps
-        )
+        if self.schedule == "wsd":
+            current_lr = wsd_lr(
+                self.step, self.total_steps, self.base_lr,
+                warmup_steps=self.warmup_steps,
+                decay_frac=self.wsd_decay_frac,
+            )
+        else:
+            current_lr = cosine_lr_with_warmup(
+                self.step, self.total_steps, self.base_lr, self.warmup_steps
+            )
         self.optimizer.learning_rate = current_lr
 
         # Cast inputs to bfloat16

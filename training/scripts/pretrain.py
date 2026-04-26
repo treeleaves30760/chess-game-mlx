@@ -49,6 +49,13 @@ import mlx.core as mx
 @click.option("--d-model", type=int, default=512, show_default=True)
 @click.option("--n-heads", type=int, default=8, show_default=True)
 @click.option("--ffn-dim", type=int, default=2048, show_default=True)
+@click.option("--schedule", type=click.Choice(["cosine", "wsd"]), default="cosine", show_default=True,
+              help="LR schedule: cosine decay or warmup-stable-decay (linear-flat-linear).")
+@click.option("--wsd-decay-frac", type=float, default=0.20, show_default=True,
+              help="Fraction of training spent in the linear decay tail (WSD only).")
+@click.option("--w-policy", type=float, default=1.0, show_default=True)
+@click.option("--w-value", type=float, default=1.0, show_default=True)
+@click.option("--w-moves-left", type=float, default=0.1, show_default=True)
 def main(
     game: str,
     steps: int,
@@ -67,6 +74,11 @@ def main(
     d_model: int,
     n_heads: int,
     ffn_dim: int,
+    schedule: str,
+    wsd_decay_frac: float,
+    w_policy: float,
+    w_value: float,
+    w_moves_left: float,
 ) -> None:
     """Pre-train ChessShogiTransformer on chess or shogi data."""
     # Late imports to keep startup fast
@@ -124,6 +136,11 @@ def main(
         total_steps=steps,
         checkpoint_dir=checkpoint_dir,
         checkpoint_every=checkpoint_every,
+        w_policy=w_policy,
+        w_value=w_value,
+        w_moves_left=w_moves_left,
+        schedule=schedule,  # type: ignore[arg-type]
+        wsd_decay_frac=wsd_decay_frac,
     )
 
     # Run
