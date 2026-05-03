@@ -60,27 +60,6 @@ def test_readyok_received(mock_client: EngineClient) -> None:
     assert ev is not None, "readyok not received within 2 seconds"
 
 
-def test_set_side_jsonrpc_no_error(mock_client: EngineClient) -> None:
-    """send set_side JSON-RPC — should not produce EngineError within 2s."""
-    from gui.engine_client import EngineError
-
-    mock_client.send_uci("uci")
-    mock_client.send_uci("isready")
-    _drain_until(mock_client, ReadyOkEvent, timeout=2.0)
-
-    mock_client.send_jsonrpc("set_side", {"me": "white"})
-
-    deadline = time.monotonic() + 2.0
-    errors = []
-    while time.monotonic() < deadline:
-        for ev in mock_client.poll_events():
-            if isinstance(ev, EngineError):
-                errors.append(ev)
-        time.sleep(0.05)
-
-    assert not errors, f"Unexpected engine errors: {errors}"
-
-
 def test_go_emits_info_and_bestmove(mock_client: EngineClient) -> None:
     """Send position + go; expect at least one InfoUpdate and one BestMoveEvent."""
     mock_client.send_uci("uci")
@@ -133,19 +112,3 @@ def test_parse_info_line_mate() -> None:
     assert info.pv == ["e2e4"]
 
 
-def test_multi_ponder_jsonrpc(mock_client: EngineClient) -> None:
-    """Send start_multi_ponder and expect a PolicyPreview notification."""
-    from gui.engine_client import PolicyPreview
-
-    mock_client.send_uci("uci")
-    _drain_until(mock_client, UciOkEvent, timeout=2.0)
-    mock_client.send_uci("isready")
-    _drain_until(mock_client, ReadyOkEvent, timeout=2.0)
-
-    mock_client.send_uci("position startpos")
-    mock_client.send_jsonrpc("start_multi_ponder", {"k": 5})
-
-    ev = _drain_until(mock_client, PolicyPreview, timeout=3.0)
-    assert ev is not None, "No PolicyPreview received"
-    assert isinstance(ev, PolicyPreview)
-    assert len(ev.moves) > 0

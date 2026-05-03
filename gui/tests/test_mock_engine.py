@@ -132,24 +132,6 @@ def test_mock_engine_multipv(initialized_client: EngineClient) -> None:
     assert len(info_multipv) >= 1, f"No InfoUpdates received (got_bestmove={got_bestmove})"
 
 
-def test_mock_engine_policy_preview(initialized_client: EngineClient) -> None:
-    """Sending start_multi_ponder should produce a PolicyPreview."""
-    from gui.engine_client import PolicyPreview
-
-    initialized_client.send_uci("position startpos")
-    initialized_client.send_jsonrpc("start_multi_ponder", {"k": 5})
-
-    ev = _wait_for(initialized_client, PolicyPreview, timeout=3.0)
-    assert ev is not None, "PolicyPreview not received"
-    assert isinstance(ev, PolicyPreview)
-    assert len(ev.moves) > 0
-    # Each entry should have 'uci' and 'prob'
-    for m in ev.moves:
-        assert "uci" in m
-        assert "prob" in m
-        assert 0.0 <= m["prob"] <= 1.0
-
-
 def test_mock_engine_get_eval_bar(initialized_client: EngineClient) -> None:
     """get_eval_bar RPC should return a valid response."""
     from gui.engine_client import EvalBarResult

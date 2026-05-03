@@ -26,19 +26,14 @@ from gui.engine_client import (
     EngineError,
     EngineEvent,
     InfoUpdate,
-    PolicyPreview,
-    PonderHit,
-    PonderMiss,
-    PonderProgress,
     ReadyOkEvent,
     UciOkEvent,
 )
-from gui.ponder_manager import PonderManager
 
 
 class GameMode(Enum):
     ANALYSIS = auto()         # go infinite, always analysing
-    SINGLE_SIDE = auto()      # engine plays only one color; multi-ponder on opp turn
+    SINGLE_SIDE = auto()      # engine plays only one color (Human vs AI)
     AI_VS_AI = auto()         # engine plays both colors, alternating turns
     STANDARD = auto()         # human vs human (engine only shows eval bar)
 
@@ -93,13 +88,11 @@ class GameController:
     def __init__(
         self,
         client: EngineClient,
-        ponder_manager: PonderManager,
         game: GameKind = "chess",
         mode: GameMode = GameMode.ANALYSIS,
         my_side: int | None = None,
     ) -> None:
         self._client = client
-        self._ponder = ponder_manager
         self._game: GameKind = game
         self.board: Any = self._new_board()
         side = my_side if my_side is not None else _first_player(game)
@@ -153,15 +146,13 @@ class GameController:
         if self.state.mode in (GameMode.ANALYSIS, GameMode.SINGLE_SIDE, GameMode.AI_VS_AI):
             self._client.send_uci(f"setoption name MultiPV value {self._multi_pv}")
 
-        if self.state.mode == GameMode.SINGLE_SIDE:
-            self._client.send_jsonrpc(
-                "set_side", {"me": _side_label(self._game, self.state.my_side)}
-            )
-
     def new_game(self) -> None:
         """Reset board and engine state."""
+        # Halt any in-flight search first so ucinewgame's tree reset doesn't
+        # race with a running search thread on the engine side.
+        self._client.send_uci("stop")
+
         self.board = self._new_board()
-        self._ponder.reset()
         self._latest_info.clear()
         self.state.move_history = []
         self.state.status_text = self._initial_status()
@@ -173,10 +164,18 @@ class GameController:
         if self.state.mode == GameMode.ANALYSIS and self.state.analysis_active:
             self._start_analysis()
         elif self.state.mode == GameMode.AI_VS_AI:
+            self.state.turn_phase = TurnPhase.MY_TURN
             self._kick_engine_search()
         elif self.state.mode == GameMode.SINGLE_SIDE:
             if self.board.turn == self.state.my_side:
+                # Must set MY_TURN before kicking, otherwise the bestmove
+                # arrives while turn_phase is IDLE and gets dropped by the
+                # SINGLE_SIDE guard in _handle_bestmove — which leaves the
+                # engine apparently "stuck searching" with no recovery.
+                self.state.turn_phase = TurnPhase.MY_TURN
                 self._kick_engine_search()
+            else:
+                self.state.turn_phase = TurnPhase.OPP_TURN
 
     def _initial_status(self) -> str:
         first = "White" if self._game == "chess" else "Sente (先手)"
@@ -216,8 +215,7 @@ class GameController:
                 self.state.status_text = "Engine thinking..."
             else:
                 self.state.turn_phase = TurnPhase.OPP_TURN
-                self.state.status_text = "Waiting for opponent... (multi-ponder active)"
-                self._client.send_jsonrpc("start_multi_ponder", {"k": 5})
+                self.state.status_text = "Your move"
 
         elif self.state.mode == GameMode.AI_VS_AI:
             self.state.turn_phase = TurnPhase.MY_TURN
@@ -240,21 +238,80 @@ class GameController:
         self.state.status_text = f"Engine played: {move_str}"
         return True
 
-    def opponent_played(self, move: Any) -> bool:
-        """Inform controller that opponent played *move* (single-side mode)."""
-        if not self._is_legal(move):
-            return False
-        self._client.send_jsonrpc("opponent_played", {"move": self._move_to_str(move)})
-        self.board.push(move)
-        self.state.move_history.append(self._move_to_str(move))
-        self._send_position()
-        return True
-
     def _kick_engine_search(self) -> None:
         """Start the engine's bestmove search with standard time controls."""
         self._client.send_uci(
             "go wtime 600000 btime 600000 winc 5000 binc 5000"
         )
+
+    # -----------------------------------------------------------------------
+    # Undo
+    # -----------------------------------------------------------------------
+
+    def can_undo(self) -> bool:
+        """True iff at least one ply can be undone in the current mode."""
+        if not self.state.move_history:
+            return False
+        if self.state.mode == GameMode.SINGLE_SIDE:
+            return self._compute_undo_count_single_side() > 0
+        return True
+
+    def undo(self) -> bool:
+        """Mode-aware undo. Returns True if any ply was popped.
+
+        - ANALYSIS / STANDARD: pop 1 ply, optionally restart analysis.
+        - SINGLE_SIDE (Human vs AI): pop until it's the human's turn so the
+          engine doesn't auto-reply. Refuses if that's not reachable.
+        - AI_VS_AI: stop the engine, pop 2 plies, switch to STANDARD so the
+          AI doesn't immediately think again. Press AI vs AI to resume.
+        """
+        if not self.can_undo():
+            return False
+        self._client.send_uci("stop")
+
+        if self.state.mode == GameMode.SINGLE_SIDE:
+            n = self._compute_undo_count_single_side()
+            del self.state.move_history[-n:]
+            self._rebuild_board()
+            self.state.turn_phase = TurnPhase.OPP_TURN
+            self.state.status_text = "Undo — your move"
+        elif self.state.mode == GameMode.AI_VS_AI:
+            n = min(2, len(self.state.move_history))
+            del self.state.move_history[-n:]
+            self._rebuild_board()
+            self.state.mode = GameMode.STANDARD
+            self.state.analysis_active = False
+            self.state.turn_phase = TurnPhase.IDLE
+            self.state.status_text = "AI vs AI paused — undo applied"
+        else:
+            self.state.move_history.pop()
+            self.board.pop()
+            self.state.status_text = "Undo"
+
+        self._latest_info.clear()
+        self._send_position()
+        if self.state.mode == GameMode.ANALYSIS and self.state.analysis_active:
+            self._start_analysis()
+        return True
+
+    def _rebuild_board(self) -> None:
+        """Rebuild self.board from move_history (single source of truth)."""
+        self.board = self._new_board()
+        for s in self.state.move_history:
+            self.board.push(self._move_from_str(s))
+
+    def _compute_undo_count_single_side(self) -> int:
+        """How many plies to pop in SINGLE_SIDE so it's the human's turn.
+
+        Returns 0 when no such count exists (e.g. engine is the first mover
+        and only its opening move has been played).
+        """
+        current = int(self.board.turn)
+        my = int(self.state.my_side)
+        for k in range(1, len(self.state.move_history) + 1):
+            if (current ^ (k & 1)) != my:
+                return k
+        return 0
 
     # -----------------------------------------------------------------------
     # Mode switching
@@ -296,9 +353,6 @@ class GameController:
         self.state.my_side = engine_side
         self.state.analysis_active = False
 
-        self._client.send_jsonrpc(
-            "set_side", {"me": _side_label(self._game, engine_side)}
-        )
         self._client.send_uci(f"setoption name MultiPV value {self._multi_pv}")
         self.state.status_text = (
             f"Single mode — engine plays {_side_label(self._game, engine_side)}"
@@ -357,23 +411,11 @@ class GameController:
 
             case InfoUpdate() as info:
                 self._latest_info[info.multipv] = info
+                if info.multipv == 1:
+                    self._maybe_set_mate_status(info)
 
             case BestMoveEvent(move=move_str):
                 self._handle_bestmove(move_str)
-
-            case PolicyPreview(moves=moves):
-                self._ponder.on_policy_preview(moves)
-
-            case PonderProgress(trees=trees):
-                self._ponder.on_ponder_progress(trees)
-
-            case PonderHit(tree=t, instant_bestmove=bm, score_cp=cp):
-                self._ponder.on_ponder_hit(t, bm, cp)
-                self.state.status_text = f"Ponder HIT! Best: {bm}"
-
-            case PonderMiss(trees_discarded=n):
-                self._ponder.on_ponder_miss(n)
-                self.state.status_text = "Ponder miss — fresh search"
 
             case EngineError(message=msg):
                 self.state.status_text = f"Engine error: {msg[:60]}"
@@ -382,20 +424,72 @@ class GameController:
                 pass
 
     def _handle_bestmove(self, move_str: str) -> None:
+        # Defense in depth: if the latest top-1 was a forced mate but the
+        # bestmove the engine returned isn't on that PV, surface a warning.
+        # The engine fix in mcts.hpp should prevent this in normal operation,
+        # but older builds or unforeseen races may still trip it.
+        warn = self._mate_pv_mismatch(move_str)
+
         if self.state.mode == GameMode.SINGLE_SIDE:
-            if self.state.turn_phase == TurnPhase.MY_TURN:
+            # Accept the bestmove if the controller asked the engine to think
+            # (MY_TURN), or if it's the engine's turn on the board even if our
+            # turn_phase tracking lagged (e.g. fresh new_game where the engine
+            # plays first). Otherwise it's a stale bestmove from a prior
+            # search after stop/undo and must be dropped.
+            engine_turn_on_board = self.board.turn == self.state.my_side
+            if self.state.turn_phase == TurnPhase.MY_TURN or engine_turn_on_board:
                 if self.apply_engine_move(move_str):
                     self.state.turn_phase = TurnPhase.OPP_TURN
-                    self.state.status_text = "Opponent's turn"
+                    self.state.status_text = (
+                        warn or "Your move"
+                    )
+                else:
+                    self.state.status_text = (
+                        f"⚠ Engine returned illegal/null move {move_str!r}"
+                    )
+            else:
+                self.state.status_text = (
+                    f"(stale bestmove {move_str} ignored)"
+                )
         elif self.state.mode == GameMode.AI_VS_AI:
             # Apply the engine's move and immediately schedule the next search.
             if self.apply_engine_move(move_str):
-                if self.board.is_game_over() if self._game == "chess" else self.board.is_game_over():
+                if self.board.is_game_over():
                     self.state.status_text = "Game over"
                     self.state.turn_phase = TurnPhase.IDLE
                 else:
                     self._latest_info.clear()
                     self._kick_engine_search()
+                    if warn:
+                        self.state.status_text = warn
+
+    def _mate_pv_mismatch(self, move_str: str) -> str | None:
+        info = self._latest_info.get(1)
+        if info is None or not info.pv:
+            return None
+        is_mate = (
+            info.score_mate is not None
+            or info.score_cp >= 29000
+            or info.score_cp <= -29000
+        )
+        if not is_mate:
+            return None
+        if info.pv[0] == move_str:
+            return None
+        return f"⚠ Engine bestmove {move_str} is not on the mate PV ({info.pv[0]})"
+
+    def _maybe_set_mate_status(self, info: InfoUpdate) -> None:
+        if info.score_mate is not None:
+            n = abs(info.score_mate)
+            label = "必勝" if info.score_mate > 0 else "必敗"
+            self.state.status_text = f"{label} — Mate in {n}"
+            return
+        if info.score_cp >= 29000:
+            n = max(1, (32000 - info.score_cp) // 2 + 1)
+            self.state.status_text = f"必勝 — Mate in {n}"
+        elif info.score_cp <= -29000:
+            n = max(1, (32000 + info.score_cp) // 2 + 1)
+            self.state.status_text = f"必敗 — Mate in {n}"
 
     def latest_infos(self) -> list[InfoUpdate]:
         return [self._latest_info[k] for k in sorted(self._latest_info)]

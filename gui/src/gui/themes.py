@@ -57,11 +57,9 @@ class Theme:
     btn_active: Color = (90, 130, 170)
     btn_text: Color = (220, 220, 220)
 
-    # Ponder tree indicators
-    ponder_active: Color = (80, 200, 120)
-    ponder_inactive: Color = (120, 120, 140)
-    ponder_bar_fill: Color = (60, 140, 200)
-    ponder_bar_bg: Color = (50, 50, 65)
+    # Mate banner (forced win/loss indicator)
+    mate_banner_win: Color = (255, 200, 60)   # gold — we have mate
+    mate_banner_loss: Color = (220, 80, 80)   # red  — we are getting mated
 
     # Window background
     window_bg: Color = (30, 34, 40)

@@ -21,7 +21,6 @@ from gui.chess_board import ChessBoardRenderer, MoveArrow
 from gui.engine_client import EngineClient, InfoUpdate
 from gui.game_controller import GameController, GameMode, TurnPhase
 from gui.menu import GameConfig
-from gui.ponder_manager import PonderManager
 from gui.shogi_board import PendingPromotion, ShogiBoardRenderer
 from gui.themes import (
     BOARD_MARGIN,
@@ -44,11 +43,10 @@ class GameSceneAction(Enum):
 
 # Button keys — stable identifiers independent of user-facing labels.
 BTN_ANALYSIS = "analysis"
-BTN_SINGLE_W = "single_w"
-BTN_SINGLE_B = "single_b"
 BTN_AI_AI = "ai_ai"
 BTN_STANDARD = "standard"
 BTN_FLIP = "flip"
+BTN_UNDO = "undo"
 BTN_NEW = "new"
 BTN_MENU = "menu"
 
@@ -256,10 +254,8 @@ class GameScene:
 
         # Engine + controller
         self._client = EngineClient(config.engine_path_for_client(), config.game)
-        self._ponder = PonderManager()
         self._controller = GameController(
             client=self._client,
-            ponder_manager=self._ponder,
             game=config.game,
             mode=self._initial_mode(),
             my_side=self._initial_engine_side(),
@@ -342,18 +338,13 @@ class GameScene:
 
     def _build_buttons(self) -> list[tuple[str, Button]]:
         bar = self._layout["button_bar"]
-        if self.config.game == "shogi":
-            single_w_label, single_b_label = "Sente", "Gote"
-        else:
-            single_w_label, single_b_label = "Single W", "Single B"
         specs = [
             (BTN_MENU, "< Menu"),
             (BTN_ANALYSIS, "Analysis"),
-            (BTN_SINGLE_W, single_w_label),
-            (BTN_SINGLE_B, single_b_label),
             (BTN_AI_AI, "AI vs AI"),
             (BTN_STANDARD, "Standard"),
             (BTN_FLIP, "Flip"),
+            (BTN_UNDO, "Undo"),
             (BTN_NEW, "New"),
         ]
         bw = 76
@@ -368,27 +359,12 @@ class GameScene:
 
     def _update_button_selected(self) -> None:
         state = self._controller.state
-        engine_side = state.my_side
         analysing = (
             state.mode == GameMode.ANALYSIS and state.analysis_active
-        )
-        first_side = (
-            chess.WHITE if self.config.game == "chess" else shogi.BLACK
-        )
-        second_side = (
-            chess.BLACK if self.config.game == "chess" else shogi.WHITE
         )
         for key, btn in self._buttons:
             if key == BTN_ANALYSIS:
                 btn.selected = analysing
-            elif key == BTN_SINGLE_W:
-                btn.selected = (
-                    state.mode == GameMode.SINGLE_SIDE and engine_side == first_side
-                )
-            elif key == BTN_SINGLE_B:
-                btn.selected = (
-                    state.mode == GameMode.SINGLE_SIDE and engine_side == second_side
-                )
             elif key == BTN_AI_AI:
                 btn.selected = state.mode == GameMode.AI_VS_AI
             elif key == BTN_STANDARD:
@@ -402,14 +378,6 @@ class GameScene:
             return GameSceneAction.BACK_TO_MENU
         if key == BTN_ANALYSIS:
             controller.toggle_analysis()
-        elif key == BTN_SINGLE_W:
-            controller.set_single_side(
-                chess.WHITE if self.config.game == "chess" else shogi.BLACK
-            )
-        elif key == BTN_SINGLE_B:
-            controller.set_single_side(
-                chess.BLACK if self.config.game == "chess" else shogi.WHITE
-            )
         elif key == BTN_AI_AI:
             controller.set_mode(GameMode.AI_VS_AI)
         elif key == BTN_STANDARD:
@@ -417,9 +385,12 @@ class GameScene:
         elif key == BTN_FLIP:
             self._flipped = not self._flipped
             self._board_renderer.flipped = self._flipped
+        elif key == BTN_UNDO:
+            self._do_undo()
         elif key == BTN_NEW:
             controller.new_game()
             self._clear_selection()
+            self._analysis_panel.reset()
             if isinstance(self._board_renderer, ChessBoardRenderer):
                 self._board_renderer.set_selected(None)
                 self._board_renderer.set_last_move(None)
@@ -429,6 +400,20 @@ class GameScene:
                 self._board_renderer.set_last_move(None)
                 self._board_renderer.set_pending_promotion(None)
         return GameSceneAction.NONE
+
+    def _do_undo(self) -> None:
+        if not self._controller.undo():
+            return
+        self._clear_selection()
+        self._analysis_panel.reset()
+        if isinstance(self._board_renderer, ChessBoardRenderer):
+            self._board_renderer.set_selected(None)
+            self._board_renderer.set_last_move(None)
+            self._board_renderer.set_arrows([])
+        else:
+            self._board_renderer.clear_selection()
+            self._board_renderer.set_last_move(None)
+            self._board_renderer.set_pending_promotion(None)
 
     def _clear_selection(self) -> None:
         self._selected_square = None
@@ -462,6 +447,9 @@ class GameScene:
             elif event.key == pygame.K_n:
                 self._controller.new_game()
                 self._clear_selection()
+                self._analysis_panel.reset()
+            elif event.key == pygame.K_LEFT:
+                self._do_undo()
 
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             # Promotion dialog intercepts all clicks until resolved.
@@ -509,7 +497,7 @@ class GameScene:
         if self._chess_pending_promo is not None:
             self._draw_chess_promotion_overlay()
 
-        self._analysis_panel.render(self._ponder)
+        self._analysis_panel.render()
 
         if self.config.game == "chess":
             _render_chess_move_list(

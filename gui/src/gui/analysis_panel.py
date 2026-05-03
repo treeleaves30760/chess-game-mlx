@@ -5,7 +5,7 @@ Renders into a pygame.Surface region:
 - Top-3 move list with scores
 - PV line
 - Depth / NPS / nodes stats
-- Ponder tree progress (during multi-ponder)
+- Mate banner when the engine reports a forced win/loss.
 """
 
 from __future__ import annotations
@@ -15,7 +15,6 @@ import math
 import pygame
 
 from gui.engine_client import InfoUpdate
-from gui.ponder_manager import PonderManager
 from gui.themes import (
     DEFAULT_THEME,
     EVAL_BAR_MAX_CP,
@@ -80,10 +79,10 @@ class AnalysisPanel:
     # Rendering
     # -----------------------------------------------------------------------
 
-    def render(self, ponder_manager: PonderManager) -> None:
+    def render(self) -> None:
         """Draw both the eval bar and the right analysis panel."""
         self._draw_eval_bar()
-        self._draw_right_panel(ponder_manager)
+        self._draw_right_panel()
 
     def _get_font(self, name: str, size: int, bold: bool = False) -> pygame.font.Font:
         key = f"{name}_{size}_{bold}"
@@ -136,7 +135,7 @@ class AnalysisPanel:
     # Right panel
     # -----------------------------------------------------------------------
 
-    def _draw_right_panel(self, ponder_manager: PonderManager) -> None:
+    def _draw_right_panel(self) -> None:
         r = self.right_panel_rect
         # Panel background
         pygame.draw.rect(self.surface, self.theme.panel_bg, r)
@@ -145,6 +144,9 @@ class AnalysisPanel:
         y = r.top + 8
         x_margin = r.left + 8
         max_w = r.width - 16
+
+        # -- Mate banner (only when the top PV is a forced win/loss) --
+        y = self._draw_mate_banner(x_margin, y, max_w)
 
         # -- Eval summary row --
         y = self._draw_eval_summary(x_margin, y, max_w)
@@ -160,14 +162,6 @@ class AnalysisPanel:
 
         # -- PV line --
         y = self._draw_pv(x_margin, y, max_w)
-        y += 4
-
-        # -- Divider --
-        pygame.draw.line(self.surface, self.theme.panel_border, (x_margin, y), (r.right - 8, y), 1)
-        y += 8
-
-        # -- Ponder trees --
-        self._draw_ponder_trees(x_margin, y, max_w, ponder_manager)
 
     def _draw_eval_summary(self, x: int, y: int, max_w: int) -> int:
         """Draw eval score + depth/NPS/nodes. Returns new y."""
@@ -251,59 +245,40 @@ class AnalysisPanel:
 
         return y
 
-    def _draw_ponder_trees(
-        self,
-        x: int,
-        y: int,
-        max_w: int,
-        ponder_manager: PonderManager,
-    ) -> int:
-        """Draw ponder tree progress bars. Returns new y."""
-        header_font = self._font(FONT_SMALL, bold=True)
-        tree_font = self._font(FONT_SMALL)
+    def _detect_mate(self) -> tuple[int, bool] | None:
+        """If top PV is a forced mate, return (mate_in_N, white_winning). Else None.
 
-        header_surf = header_font.render("Ponder trees:", True, self.theme.text_primary)
-        self.surface.blit(header_surf, (x, y))
-        y += header_surf.get_height() + 4
+        Engines may emit either ``score mate N`` (newer) or saturate ``score cp``
+        near ±32000 (older). Both paths are handled here.
+        """
+        if not self._infos:
+            return None
+        top = self._infos[0]
+        if top.score_mate is not None:
+            n = abs(top.score_mate)
+            return (max(1, n), top.score_mate > 0)
+        if top.score_cp >= 29000:
+            n = (32000 - top.score_cp) // 2 + 1
+            return (max(1, n), True)
+        if top.score_cp <= -29000:
+            n = (32000 + top.score_cp) // 2 + 1
+            return (max(1, n), False)
+        return None
 
-        trees = ponder_manager.trees_snapshot()
-        if not trees:
-            if ponder_manager.hit_bestmove:
-                # Show hit info
-                hit_color = self.theme.ponder_active
-                hit_str = f"Hit! Best: {ponder_manager.hit_bestmove}"
-                surf = tree_font.render(hit_str, True, hit_color)
-                self.surface.blit(surf, (x, y))
-                y += surf.get_height() + 2
-            else:
-                no_surf = tree_font.render("(not active)", True, self.theme.text_secondary)
-                self.surface.blit(no_surf, (x, y))
-                y += no_surf.get_height()
+    def _draw_mate_banner(self, x: int, y: int, max_w: int) -> int:
+        """Draw a gold/red mate banner when a forced mate is detected. Returns new y."""
+        mate = self._detect_mate()
+        if mate is None:
             return y
+        n, winning = mate
+        color = self.theme.mate_banner_win if winning else self.theme.mate_banner_loss
+        label = f"⚑ MATE in {n} ⚑" if winning else f"⚑ Mated in {n} ⚑"
 
-        bar_h = 8
-        bar_gap = 4
-        hit_tree = ponder_manager.hit_tree
-
-        for tree in trees[:5]:
-            is_hit = hit_tree is not None and tree.tree_id == hit_tree
-            color = self.theme.ponder_active if is_hit else self.theme.ponder_inactive
-            bullet = "●" if is_hit else "○"
-
-            sign = "+" if tree.score_cp >= 0 else ""
-            label = f"{bullet} {tree.opponent_move:<8} d{tree.depth:<3} {sign}{tree.score_cp / 100:.2f}"
-            surf = tree_font.render(label, True, color)
-            self.surface.blit(surf, (x, y))
-            y += surf.get_height() + 1
-
-            # Budget bar
-            bar_w = int(max_w * tree.budget_weight)
-            bar_rect = pygame.Rect(x, y, max_w, bar_h)
-            fill_rect = pygame.Rect(x, y, bar_w, bar_h)
-            pygame.draw.rect(self.surface, self.theme.ponder_bar_bg, bar_rect)
-            bar_color = self.theme.ponder_active if is_hit else self.theme.ponder_bar_fill
-            pygame.draw.rect(self.surface, bar_color, fill_rect)
-
-            y += bar_h + bar_gap
-
-        return y
+        font = self._font(FONT_MEDIUM, bold=True)
+        text_surf = font.render(label, True, (0, 0, 0))
+        h = text_surf.get_height() + 8
+        rect = pygame.Rect(x, y, max_w, h)
+        pygame.draw.rect(self.surface, color, rect, border_radius=4)
+        pygame.draw.rect(self.surface, self.theme.panel_border, rect, 1, border_radius=4)
+        self.surface.blit(text_surf, text_surf.get_rect(center=rect.center))
+        return y + h + 6

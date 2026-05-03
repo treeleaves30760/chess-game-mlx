@@ -8,8 +8,7 @@ The mock engine:
 - Responds to all standard UCI commands
 - Generates random legal moves via python-chess
 - Emits fake info lines every ~500 ms with increasing depth and random score
-- Responds to JSON-RPC start_multi_ponder with fake policy_preview and
-  ponder_progress events
+- Answers the get_eval_bar / get_top_moves JSON-RPC queries with random data
 """
 
 from __future__ import annotations
@@ -83,17 +82,12 @@ class MockEngine:
         self._searching = threading.Event()
         self._stop_search = threading.Event()
         self._search_thread: threading.Thread | None = None
-        self._multi_ponder = threading.Event()
-        self._stop_ponder = threading.Event()
-        self._ponder_thread: threading.Thread | None = None
         self._options: dict[str, str] = {
             "MultiPV": "1",
             "Hash": "512",
             "Threads": "4",
             "NN_Weights": "",
-            "Ponder": "true",
         }
-        self._side: str | None = None  # set by set_side RPC
         self._rpc_id_counter: int = 0
 
     # -----------------------------------------------------------------------
@@ -129,7 +123,6 @@ class MockEngine:
             _write("option name Hash type spin default 512 min 16 max 16384")
             _write("option name Threads type spin default 4 min 1 max 16")
             _write("option name NN_Weights type string default ")
-            _write("option name Ponder type check default true")
             _write("uciok" if cmd == "uci" else "usiok")
 
         elif cmd == "isready":
@@ -137,7 +130,6 @@ class MockEngine:
 
         elif cmd in ("ucinewgame", "usinewgame"):
             self._board = chess.Board()
-            self._side = None
 
         elif cmd == "position":
             self._parse_position(tokens[1:])
@@ -148,16 +140,11 @@ class MockEngine:
         elif cmd == "stop":
             self._stop_search.set()
 
-        elif cmd == "ponderhit":
-            # Transition from ponder to real search — just continue
-            pass
-
         elif cmd == "setoption":
             self._parse_setoption(tokens[1:])
 
         elif cmd == "quit":
             self._stop_search.set()
-            self._stop_ponder.set()
             sys.exit(0)
 
     def _parse_position(self, tokens: list[str]) -> None:
@@ -289,12 +276,7 @@ class MockEngine:
         legal = list(board.legal_moves)
         if legal:
             best = random.choice(legal)
-            legal2 = [m for m in legal if m != best]
-            if legal2:
-                ponder = random.choice(legal2)
-                _write(f"bestmove {best.uci()} ponder {ponder.uci()}")
-            else:
-                _write(f"bestmove {best.uci()}")
+            _write(f"bestmove {best.uci()}")
         else:
             _write("bestmove 0000")
 
@@ -312,24 +294,7 @@ class MockEngine:
         params = obj.get("params", {})
         req_id = obj.get("id")
 
-        if method == "set_side":
-            self._side = params.get("me", "white")
-            if req_id is not None:
-                _write_json({
-                    "jsonrpc": "2.0",
-                    "result": {"ok": True},
-                    "id": req_id,
-                })
-
-        elif method == "start_multi_ponder":
-            k = params.get("k", 5)
-            self._start_multi_ponder(k, req_id)
-
-        elif method == "opponent_played":
-            move = params.get("move", "")
-            self._handle_opponent_played(move, req_id)
-
-        elif method == "get_eval_bar":
+        if method == "get_eval_bar":
             score_cp = random.randint(-80, 80)
             win_prob = 0.5 + score_cp / 1000.0
             win_prob = max(0.05, min(0.95, win_prob))
@@ -369,101 +334,6 @@ class MockEngine:
                     "result": {"moves": moves_info},
                     "id": req_id,
                 })
-
-    def _start_multi_ponder(self, k: int, req_id: int | None) -> None:
-        """Start fake multi-ponder background thread."""
-        # Stop existing ponder if any
-        if self._ponder_thread and self._ponder_thread.is_alive():
-            self._stop_ponder.set()
-            self._ponder_thread.join(timeout=0.5)
-
-        self._stop_ponder.clear()
-
-        board_snapshot = self._board.copy()
-        top_moves = _fake_top_moves(board_snapshot, k)
-
-        # Emit policy_preview immediately
-        _write_json({
-            "jsonrpc": "2.0",
-            "method": "policy_preview",
-            "params": {"moves": top_moves},
-        })
-
-        if req_id is not None:
-            _write_json({
-                "jsonrpc": "2.0",
-                "result": {"ok": True, "k": k},
-                "id": req_id,
-            })
-
-        # Spawn ponder progress thread
-        self._ponder_thread = threading.Thread(
-            target=self._ponder_loop,
-            args=(board_snapshot, top_moves),
-            daemon=True,
-        )
-        self._ponder_thread.start()
-
-    def _ponder_loop(
-        self, board: chess.Board, top_moves: list[dict[str, Any]]
-    ) -> None:
-        """Emit ponder_progress notifications every 500ms."""
-        depth = 5
-        while not self._stop_ponder.wait(timeout=0.5):
-            trees = []
-            for i, m in enumerate(top_moves):
-                b2 = board.copy()
-                try:
-                    move = chess.Move.from_uci(m["uci"])
-                    if move in b2.legal_moves:
-                        b2.push(move)
-                except ValueError:
-                    pass
-                pv = _fake_pv(b2, depth)
-                trees.append({
-                    "tree": i,
-                    "opponent_move": m["uci"],
-                    "depth": depth,
-                    "score_cp": random.randint(-60, 60),
-                    "pv": pv,
-                })
-            _write_json({
-                "jsonrpc": "2.0",
-                "method": "ponder_progress",
-                "params": {"trees": trees},
-            })
-            depth += 1
-
-    def _handle_opponent_played(self, move_uci: str, req_id: int | None) -> None:
-        """Simulate ponder_hit or ponder_miss."""
-        # 60% chance of hit for demo purposes
-        if random.random() < 0.6:
-            score_cp = random.randint(-50, 50)
-            legal = list(self._board.legal_moves)
-            best_uci = random.choice(legal).uci() if legal else "0000"
-            _write_json({
-                "jsonrpc": "2.0",
-                "method": "ponder_hit",
-                "params": {
-                    "tree": 0,
-                    "instant_bestmove": best_uci,
-                    "score_cp": score_cp,
-                },
-            })
-            _write(f"bestmove {best_uci}")
-        else:
-            _write_json({
-                "jsonrpc": "2.0",
-                "method": "ponder_miss",
-                "params": {"trees_discarded": 5},
-            })
-
-        if req_id is not None:
-            _write_json({
-                "jsonrpc": "2.0",
-                "result": {"ok": True},
-                "id": req_id,
-            })
 
 
 # ---------------------------------------------------------------------------

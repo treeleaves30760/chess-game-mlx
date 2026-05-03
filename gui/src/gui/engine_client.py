@@ -87,32 +87,6 @@ class BestMoveEvent:
 
 
 @dataclass
-class PolicyPreview:
-    """JSON-RPC policy_preview notification."""
-    moves: list[dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass
-class PonderProgress:
-    """JSON-RPC ponder_progress notification."""
-    trees: list[dict[str, Any]] = field(default_factory=list)
-
-
-@dataclass
-class PonderHit:
-    """JSON-RPC ponder_hit notification."""
-    tree: int = 0
-    instant_bestmove: str = ""
-    score_cp: int = 0
-
-
-@dataclass
-class PonderMiss:
-    """JSON-RPC ponder_miss notification."""
-    trees_discarded: int = 0
-
-
-@dataclass
 class EvalBarResult:
     """Response to get_eval_bar JSON-RPC call."""
     score_cp: int = 0
@@ -139,10 +113,6 @@ EngineEvent = (
     | ReadyOkEvent
     | InfoUpdate
     | BestMoveEvent
-    | PolicyPreview
-    | PonderProgress
-    | PonderHit
-    | PonderMiss
     | EvalBarResult
     | TopMovesResult
     | EngineError
@@ -336,8 +306,13 @@ class EngineClient:
         try:
             self._process.stdin.write(line + "\n")
             self._process.stdin.flush()
-        except OSError:
-            pass
+        except OSError as e:
+            # Engine subprocess is dead and we can't write to it any more.
+            # Surface this so the GUI doesn't silently keep "trying" to drive
+            # an engine that is gone.
+            self._event_queue.put(
+                EngineError(message=f"send to engine failed: {e}")
+            )
 
     def send_jsonrpc(
         self,
@@ -397,6 +372,16 @@ class EngineClient:
             if not line:
                 continue
             self._dispatch_line(line)
+
+        # The for-loop ends when stdout closes — typically because the engine
+        # process exited. If we didn't ask it to stop, surface an error so the
+        # GUI can show "engine died" instead of silently sitting forever
+        # waiting for a bestmove that will never arrive.
+        if not self._stopped.is_set():
+            rc = self._process.poll() if self._process else None
+            self._event_queue.put(
+                EngineError(message=f"engine process exited (rc={rc})")
+            )
 
     def _dispatch_line(self, line: str) -> None:
         """Parse and enqueue an event for a single stdout line."""
@@ -480,18 +465,6 @@ class EngineClient:
             )
 
     def _parse_notification(self, method: str, params: dict[str, Any]) -> EngineEvent | None:
-        if method == "policy_preview":
-            return PolicyPreview(moves=params.get("moves", []))
-        if method == "ponder_progress":
-            return PonderProgress(trees=params.get("trees", []))
-        if method == "ponder_hit":
-            return PonderHit(
-                tree=params.get("tree", 0),
-                instant_bestmove=params.get("instant_bestmove", ""),
-                score_cp=params.get("score_cp", 0),
-            )
-        if method == "ponder_miss":
-            return PonderMiss(trees_discarded=params.get("trees_discarded", 0))
         return None
 
     # -----------------------------------------------------------------------
