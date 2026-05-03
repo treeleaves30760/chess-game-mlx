@@ -145,8 +145,14 @@ public:
             } else if (cmd == "setoption") {
                 handle_setoption(tokens);
             } else if (cmd == ProtocolTraits::newgame_keyword()) {
-                mcts_.reset();
+                // Halt any in-flight search before clearing the tree —
+                // mcts_.reset() under tree_mtx_ does not stop a running
+                // search, and clearing nodes_ while workers descend the
+                // tree would be undefined behaviour.
+                mcts_.stop();
                 mponder_mgr_.stop();
+                wait_for_search();
+                mcts_.reset();
                 current_pos_ = ProtocolTraits::start_position();
                 pos_set_ = true;
             } else if (cmd == "position") {
@@ -357,8 +363,20 @@ private:
             oss << " multipv " << (k + 1);
             const float stm_v = r.top_values[static_cast<std::size_t>(k)];
             const float white_v = root_stm_is_white_ ? stm_v : -stm_v;
-            const int cp = value_to_cp(white_v);
-            oss << " score cp " << cp;
+            // Forced-mate threshold: when MCTS has resolved a subtree to a
+            // certain win/loss, |stm_v| approaches 1.0. Emit `score mate N`
+            // so GUIs can surface a "Mate in N" indicator instead of a giant
+            // centipawn score.
+            constexpr float kMateValueThreshold = 0.99f;
+            if (std::abs(white_v) > kMateValueThreshold) {
+                const int mate_in = std::max(
+                    1, static_cast<int>((pv.size() + 1) / 2));
+                const int sign = (white_v > 0.0f) ? 1 : -1;
+                oss << " score mate " << (sign * mate_in);
+            } else {
+                const int cp = value_to_cp(white_v);
+                oss << " score cp " << cp;
+            }
             oss << " nodes "    << r.nodes;
             oss << " nps "      << nps;
             oss << " time "     << r.elapsed_ms;

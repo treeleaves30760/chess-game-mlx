@@ -1022,8 +1022,19 @@ private:
             cd.move   = (p >= 0) ? Traits::policy_idx_to_move(p, root_pos) : Move{};
             cands.push_back(cd);
         }
-        // Sort by visits desc, then by q desc.
+        // Proven-win first, then visits desc, then q desc.
+        // A candidate with q ≥ kProvenWinThreshold has had its subtree resolved
+        // to a forced win for the side to move; we must never lose such a move
+        // to a non-mating candidate that simply accumulated more visits.
+        constexpr double kProvenWinThreshold = 0.99;
         std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
+            const bool a_proven = a.q >= kProvenWinThreshold;
+            const bool b_proven = b.q >= kProvenWinThreshold;
+            if (a_proven != b_proven) return a_proven;
+            if (a_proven) {
+                if (a.q != b.q) return a.q > b.q;
+                return a.visits > b.visits;
+            }
             if (a.visits != b.visits) return a.visits > b.visits;
             return a.q > b.q;
         });
