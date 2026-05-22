@@ -34,6 +34,7 @@ data/dlshogi/*
 !data/dlshogi/.gitkeep
 data/lc0_nets/*
 !data/lc0_nets/.gitkeep
+data/dlshogi_nets/
 data/*.npz
 
 # IDE
