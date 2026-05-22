@@ -22,14 +22,48 @@ namespace chess_mlx::nn {
 // NNOutput — a single evaluation result.
 // ---------------------------------------------------------------------------
 //
-// `policy` is a dense logit-style array of size `policy_size`.  The caller
-// converts it to probabilities (softmax + legal-move mask).
+// Logit access goes through `policy_at(i)`.  Two storage modes are supported:
+//
+//   1. Owned (`policy` non-empty): the result holds its own logit buffer.
+//      Used by `evaluate()` and any backend that doesn't share a batch
+//      buffer.  Simple but allocates per-leaf.
+//
+//   2. Shared (`policy_shared` set): a batch of leaves all reference one
+//      contiguous logit tensor, each leaf reading at its own
+//      `[policy_offset, policy_offset+policy_extent)` slice.  This eliminates
+//      the per-leaf 1858/4672-float malloc that used to dominate the
+//      post-GPU CPU portion of the search loop.
+//
 // `value`       is in [-1, +1], positive = white / 先手 advantage.
 // `moves_left`  is a non-negative scalar (half-moves remaining estimate).
 struct NNOutput {
-    std::vector<float> policy;   // size = 4672 (chess) or 2187 (shogi)
+    // Owned mode storage.  Empty when shared mode is active.
+    std::vector<float> policy;
+
+    // Shared mode: one contiguous buffer for an entire batch; each leaf
+    // reads its own slice.  When non-null this overrides `policy`.
+    std::shared_ptr<const std::vector<float>> policy_shared{};
+    std::size_t policy_offset{0};   // start index inside *policy_shared
+    std::size_t policy_extent{0};   // number of logits this leaf owns
+
     float              value{0.0f};
     float              moves_left{50.0f};
+
+    // Effective number of logits available to the caller.
+    [[nodiscard]] std::size_t policy_size() const noexcept {
+        return policy_shared ? policy_extent : policy.size();
+    }
+
+    // Read a single logit by index.  Out-of-range reads return 0.0f, matching
+    // the legacy "absent slot" convention so callers don't have to bounds-check.
+    [[nodiscard]] float policy_at(std::size_t i) const noexcept {
+        if (policy_shared) {
+            return (i < policy_extent)
+                ? (*policy_shared)[policy_offset + i]
+                : 0.0f;
+        }
+        return (i < policy.size()) ? policy[i] : 0.0f;
+    }
 };
 
 // ---------------------------------------------------------------------------

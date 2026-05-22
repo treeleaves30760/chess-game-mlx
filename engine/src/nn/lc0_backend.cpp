@@ -20,13 +20,65 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace chess_mlx::nn {
+
+// Returns a per-host cache directory for CoreML compiled models.  We avoid
+// per-process temp dirs because the CoreML EP recompiles on every cache miss,
+// which can add many seconds to engine startup on large LC0 nets like BT4.
+//
+// Layout: $HOME/.cache/chess_mlx/coreml/<basename-of-onnx>/
+// The CoreML EP itself sub-keys by model hash, so multiple sessions for the
+// same ONNX share the cache and a model update invalidates the entries
+// without needing manual cache eviction.
+static std::string coreml_cache_dir(const std::string& onnx_path) {
+    namespace fs = std::filesystem;
+    const char* home = std::getenv("HOME");
+    fs::path base = home ? fs::path(home) / ".cache" / "chess_mlx" / "coreml"
+                         : fs::temp_directory_path() / "chess_mlx_coreml";
+    base /= fs::path(onnx_path).stem().string();  // e.g. "BT4"
+    std::error_code ec;
+    fs::create_directories(base, ec);  // best-effort
+    return base.string();
+}
+
+// Whether to attempt CoreML EP registration.  Driven by the
+// CHESS_MLX_LC0_EP env var; default is OFF.
+//
+// Why off by default: for the BT4 net (740 MB, 15 transformer layers,
+// dynamic batch dim) the CoreML EP on macOS 15+ partitions the graph
+// into ~70 dynamic_mlprogram subgraphs and persists ~3.5 GB of
+// compiled artefacts to disk.  Cold compile takes ~10 minutes; even
+// warm load (cache hit) is in the 5-minute range because Apple's
+// MLProgram runtime re-validates each subgraph per session.  Until we
+// either:
+//   (a) freeze the batch dim before passing the model to ORT (so
+//       CoreML lands the whole graph on a single static MLProgram), or
+//   (b) ship a much smaller LC0 net (e.g. t1_256_distilled) where the
+//       partitioning overhead is amortised more favourably,
+// CoreML on BT4 is a worse user experience than the CPU EP.
+//
+// For users who explicitly want to evaluate it (and accept the cold
+// compile), set:
+//   export CHESS_MLX_LC0_EP=coreml
+//
+// To silence the "running on CPU EP" info-string log:
+//   export CHESS_MLX_LC0_EP=cpu
+static bool env_enable_coreml() {
+    const char* ep = std::getenv("CHESS_MLX_LC0_EP");
+    if (!ep || !*ep) return false;           // default = CPU only
+    const std::string s = ep;
+    if (s == "cpu" || s == "off" || s == "0" || s == "false") return false;
+    return s.find("coreml") != std::string::npos;
+}
 
 // ---------------------------------------------------------------------------
 // Impl struct: holds ORT objects.
@@ -52,7 +104,58 @@ struct Lc0Backend::Impl {
         opts.SetIntraOpNumThreads(intra_threads);
         opts.SetInterOpNumThreads(inter_threads);
         opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-        // CPU-only: no AppendExecutionProvider_CoreML() to avoid 10-min compile.
+
+        // -----------------------------------------------------------------
+        // CoreML execution provider (Apple Silicon ANE / GPU).
+        //
+        // ORT-CPU on an M3 manages roughly 1-2 inferences/sec for a network
+        // the size of BT4 (740 MB).  CoreML 5 + MLProgram running on ANE/GPU
+        // is typically 10-50× faster per batch.  The first-run cost is a
+        // 10-60 second model-compile; we persist the compiled artefact to a
+        // hashed cache directory under $HOME/.cache so subsequent runs start
+        // in well under a second.
+        //
+        // We append CoreML BEFORE the implicit CPU EP, so CoreML claims
+        // every op it can run; whatever it refuses falls back to the CPU EP
+        // automatically.  If the registration itself fails (e.g. no Apple
+        // Silicon, ORT built without CoreML support), the catch below logs
+        // it and we keep going on CPU.
+        // -----------------------------------------------------------------
+        const bool coreml_requested = env_enable_coreml();
+        bool coreml_active = false;
+        if (coreml_requested) {
+            try {
+                const std::string cache_dir = coreml_cache_dir(onnx_path);
+                std::unordered_map<std::string, std::string> coreml_opts{
+                    // MLProgram is CoreML 5+; supports a wider op set and runs
+                    // more reliably on the Neural Engine than the older
+                    // NeuralNetwork format.
+                    {"ModelFormat",            "MLProgram"},
+                    // Let CoreML pick the best engine per op (ANE for what fits,
+                    // Metal GPU for the rest).
+                    {"MLComputeUnits",         "ALL"},
+                    // BT4 input is [B, 112, 8, 8] with dynamic batch — allow
+                    // dynamic-shape ops so the whole graph lands on CoreML
+                    // instead of partitioning around the batch dim.
+                    {"RequireStaticInputShapes", "0"},
+                    {"EnableOnSubgraphs",       "0"},
+                    // Persist compiled artefacts; key derived per model dir.
+                    {"ModelCacheDirectory",    cache_dir},
+                };
+                opts.AppendExecutionProvider("CoreML", coreml_opts);
+                coreml_active = true;
+                std::cerr << "info string Lc0Backend: CoreML EP appended, cache="
+                          << cache_dir << "\n";
+            } catch (const std::exception& e) {
+                std::cerr << "info string Lc0Backend: CoreML EP unavailable ("
+                          << e.what() << "); using CPU EP\n";
+            }
+        }
+        if (!coreml_active) {
+            std::cerr << "info string Lc0Backend: running on CPU EP "
+                      << "(set CHESS_MLX_LC0_EP=coreml to opt in, "
+                      << "or =cpu to silence this)\n";
+        }
 
         session = Ort::Session(env, onnx_path.c_str(), opts);
 
@@ -224,14 +327,18 @@ std::vector<NNOutput> Lc0Backend::evaluate_batch(
                     kStride * sizeof(float));
     }
 
-    const auto raw = run_ort(flat.data(), B);
+    auto raw = run_ort(flat.data(), B);
+
+    // Share one batched logit buffer across all NNOutput results.
+    // raw.policy is already a contiguous [B * 1858] vector; move it into a
+    // shared_ptr so leaves can read in-place via NNOutput::policy_at().
+    auto shared_pol = std::make_shared<std::vector<float>>(std::move(raw.policy));
 
     std::vector<NNOutput> results(B);
     for (std::size_t i = 0; i < B; ++i) {
-        // Policy in LC0's 1858-slot space — copy directly
-        results[i].policy.assign(
-            raw.policy.begin() + static_cast<std::ptrdiff_t>(i * 1858),
-            raw.policy.begin() + static_cast<std::ptrdiff_t>((i + 1) * 1858));
+        results[i].policy_shared = shared_pol;
+        results[i].policy_offset = i * 1858;
+        results[i].policy_extent = 1858;
         results[i].value      = wdl_to_value(raw.wdl.data() + i * 3);
         results[i].moves_left = raw.mlh[i];
     }

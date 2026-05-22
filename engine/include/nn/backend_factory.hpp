@@ -20,8 +20,15 @@ struct BackendConfig {
     std::string weights_path;    // MLX safetensors path — empty => StubBackend
     std::string lc0_onnx_path;  // LC0 ONNX path — takes priority over weights_path
     bool        force_stub{false};
-    // Threads hint for LC0 backend (intra-op threads).
-    int         lc0_threads{1};
+    // Threads hint for the NN backend's *inference* parallelism, e.g. ORT's
+    // SetIntraOpNumThreads for Lc0Backend.  Distinct from MCTS worker thread
+    // count, which is configured separately on the MCTS instance.  For MLX
+    // backend this is ignored (Metal dispatches on its own queue).
+    int         nn_threads{1};
+
+    // Deprecated alias retained for source compatibility.  When non-zero
+    // overrides `nn_threads` if `nn_threads` is left at its default of 1.
+    int         lc0_threads{0};
 };
 
 // Create the best-available backend given the config.

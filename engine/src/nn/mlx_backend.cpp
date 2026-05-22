@@ -666,7 +666,90 @@ MlxBackend::MlxBackend(const std::string& weights_path,
               << "; game=" << config_.game
               << " layers=" << config_.n_layers
               << " d_model=" << config_.d_model
+              << " seq_len=" << config_.seq_len
+              << " feat_dim=" << config_.feat_dim
               << " num_moves=" << config_.num_moves << "\n";
+
+    // -------------------------------------------------------------------------
+    // Sanity check: verify the sidecar's declared dims line up with the
+    // weight tensors we just loaded.  Catches three failure modes:
+    //
+    //  1. Sidecar missing / malformed → defaults applied; if the model is
+    //     actually shogi (or any non-default architecture) the first-layer
+    //     input projection's shape won't match.
+    //  2. Sidecar inconsistent with weights → user copied the wrong .json.
+    //  3. Factory mis-routed the load → e.g. someone passed a shogi
+    //     checkpoint as `--weights` to the chess engine.  The chess
+    //     prefix would resolve to nonexistent tensor names and we'd fail
+    //     with an obscure missing-parameter error deep in build_graph;
+    //     here we catch it loudly with the right diagnostic.
+    //
+    // The check is cheap (one tensor lookup, two shape compares) so it
+    // runs unconditionally even in release builds.
+    // -------------------------------------------------------------------------
+    {
+        const std::string in_proj_key = impl_->prefix + "input_proj.weight";
+        auto it_w = impl_->params.find(in_proj_key);
+        if (it_w == impl_->params.end()) {
+            throw std::runtime_error(
+                "MlxBackend: weights file " + weights_path +
+                " does not contain '" + in_proj_key +
+                "' — sidecar reports game='" + config_.game +
+                "' but the safetensors looks like a different game "
+                "(check the .json sidecar's `game` field).");
+        }
+        const int wn = static_cast<int>(mlx_array_ndim(it_w->second));
+        if (wn != 2) {
+            throw std::runtime_error(
+                "MlxBackend: " + in_proj_key + " is not a 2-D tensor "
+                "(rank=" + std::to_string(wn) + ").");
+        }
+        const int rows = static_cast<int>(mlx_array_dim(it_w->second, 0));  // d_model
+        const int cols = static_cast<int>(mlx_array_dim(it_w->second, 1));  // feat_dim
+        if (rows != config_.d_model || cols != config_.feat_dim) {
+            std::ostringstream oss;
+            oss << "MlxBackend: sidecar/weights shape mismatch for "
+                << in_proj_key << " — sidecar declares ["
+                << config_.d_model << ", " << config_.feat_dim
+                << "] but the loaded tensor is [" << rows << ", " << cols
+                << "].  Likely cause: an old per-step checkpoint whose "
+                   "sidecar lacks architecture fields and falls back to "
+                   "chess defaults.  Re-export via training.export.export_model() "
+                   "or update training/src/training/trainers/supervised.py to "
+                   "write feat_dim/num_moves/seq_len into the .json sidecar.";
+            throw std::runtime_error(oss.str());
+        }
+
+        // Best-effort sanity check on the policy head: confirms num_moves.
+        const std::string pol_head_key = impl_->prefix + "policy_head.fc2.weight";
+        auto it_p = impl_->params.find(pol_head_key);
+        if (it_p != impl_->params.end()) {
+            const int p_rows = static_cast<int>(mlx_array_dim(it_p->second, 0));
+            if (p_rows != config_.num_moves) {
+                std::ostringstream oss;
+                oss << "MlxBackend: sidecar/weights num_moves mismatch — "
+                    << pol_head_key << " has " << p_rows << " output rows but "
+                    << "sidecar declares num_moves=" << config_.num_moves
+                    << ".  Re-export the checkpoint with up-to-date sidecar.";
+                throw std::runtime_error(oss.str());
+            }
+        }
+
+        // Cross-check sidecar's S*F against the factory-passed input_size_
+        // (the engine's encoder output width).  Mismatch means somebody
+        // routed a shogi checkpoint through the chess engine or vice versa.
+        const std::size_t sidecar_input =
+            static_cast<std::size_t>(config_.seq_len) *
+            static_cast<std::size_t>(config_.feat_dim);
+        if (input_size_ > 0 && sidecar_input != input_size_) {
+            std::cerr << "info string MlxBackend: WARNING — sidecar input "
+                      << "size (" << sidecar_input << ") != factory-expected ("
+                      << input_size_ << ").  Engine will use the sidecar value; "
+                      << "if the GUI is set up wrong (e.g. shogi model "
+                      << "loaded by chess_engine), inputs from the encoder "
+                      << "won't match and inference will fail.\n";
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Compile the forward-pass closure via mlx_compile(shapeless=true).
@@ -711,9 +794,12 @@ MlxBackend::MlxBackend(const std::string& weights_path,
     {
         std::lock_guard<std::mutex> lk(mlx_mutex_);
         const std::vector<int> warmup_batches = {1, 4, 8, 12, 16, 32};
+        // Call via `this->` to disambiguate from the local `input_size`
+        // constructor parameter (the override returns config_.seq_len * feat_dim).
+        const std::size_t in_sz = this->input_size();
         for (int wb : warmup_batches) {
             try {
-                std::vector<float> dummy(static_cast<std::size_t>(wb) * input_size_, 0.0f);
+                std::vector<float> dummy(static_cast<std::size_t>(wb) * in_sz, 0.0f);
                 forward_batch_nolock(wb, dummy);
             } catch (const std::exception& e) {
                 std::cerr << "info string MlxBackend: warmup B=" << wb
@@ -811,17 +897,37 @@ std::vector<NNOutput> MlxBackend::forward_batch_nolock(
     const float*       m_data    = mlx_array_data_float32(moves_left.arr);
     const std::size_t  total_pol = mlx_array_size(policy_logits.arr);
     const std::size_t  p_n_model = (B > 0) ? (total_pol / static_cast<std::size_t>(B)) : 0;
+    // p_extent clamps the per-leaf usable policy range to what the model
+    // actually outputs.  We deliberately do NOT clip against engine_policy_size_
+    // any more — that field was the *engine's* expected width (e.g. 4672) which
+    // for compact-1858 models would be wider than the model produces.  Callers
+    // index via NNOutput::policy_at(p), which returns 0 for out-of-range p.
+    const std::size_t  p_extent  = p_n_model;
+
+    // One contiguous batched logit buffer is materialised here and shared
+    // across all NNOutput results via shared_ptr.  The old code allocated
+    // engine_policy_size_ floats *per leaf* and then memcpy'd a (typically
+    // smaller) slice into each, leaving the tail zero-padded — that's
+    // ~120 KB of redundant alloc+zero per batch of 16.  The shared layout
+    // does one alloc, one sequential memcpy, then trivially indexes by
+    // policy_offset = i * p_n_model.
+    std::shared_ptr<std::vector<float>> shared_pol;
+    if (p_data && B > 0 && p_n_model > 0) {
+        shared_pol = std::make_shared<std::vector<float>>(
+            static_cast<std::size_t>(B) * p_n_model);
+        std::memcpy(shared_pol->data(),
+                    p_data,
+                    static_cast<std::size_t>(B) * p_n_model * sizeof(float));
+    }
 
     std::vector<NNOutput> results;
     results.reserve(static_cast<std::size_t>(B));
     for (int i = 0; i < B; ++i) {
         NNOutput r;
-        r.policy.assign(engine_policy_size_, 0.0f);
-        if (p_data && p_n_model > 0) {
-            const std::size_t copy_n = std::min(p_n_model, engine_policy_size_);
-            std::memcpy(r.policy.data(),
-                        p_data + static_cast<std::size_t>(i) * p_n_model,
-                        copy_n * sizeof(float));
+        if (shared_pol) {
+            r.policy_shared = shared_pol;
+            r.policy_offset = static_cast<std::size_t>(i) * p_n_model;
+            r.policy_extent = p_extent;
         }
         r.value      = v_data ? std::max(-1.0f, std::min(1.0f, v_data[i])) : 0.0f;
         r.moves_left = m_data ? std::max(0.0f, std::min(400.0f, m_data[i])) : 50.0f;
@@ -834,7 +940,10 @@ std::vector<NNOutput> MlxBackend::forward_batch_nolock(
 // Public single-sample evaluate — delegates to the batched path.
 // -----------------------------------------------------------------------------
 NNOutput MlxBackend::evaluate(const std::vector<float>& input_tensor) {
-    if (input_tensor.size() != input_size_)
+    // Accept whatever size the *model* expects (sidecar-driven), and not the
+    // factory-passed default — the two coincide for current chess/shogi
+    // checkpoints, but the sidecar is the source of truth.
+    if (input_tensor.size() != input_size())
         throw std::runtime_error("MlxBackend::evaluate: wrong input size");
 
     std::lock_guard<std::mutex> lk(mlx_mutex_);
@@ -849,7 +958,7 @@ NNOutput MlxBackend::evaluate(const std::vector<float>& input_tensor) {
     }
 
     NNOutput fallback;
-    fallback.policy.assign(engine_policy_size_, 0.0f);
+    fallback.policy.assign(policy_size(), 0.0f);
     fallback.value      = 0.0f;
     fallback.moves_left = 50.0f;
     return fallback;
@@ -864,15 +973,17 @@ std::vector<NNOutput> MlxBackend::evaluate_batch(
 
     const int B = static_cast<int>(inputs.size());
 
-    // Validate sizes.
+    // Validate sizes.  Use the sidecar-derived effective size, matching what
+    // the model actually consumes.
+    const std::size_t in_sz = input_size();
     for (const auto& in : inputs) {
-        if (in.size() != input_size_)
+        if (in.size() != in_sz)
             throw std::runtime_error("MlxBackend::evaluate_batch: wrong input size");
     }
 
     // Build flat buffer: [B * S * F].
     std::vector<float> flat;
-    flat.reserve(static_cast<std::size_t>(B) * input_size_);
+    flat.reserve(static_cast<std::size_t>(B) * in_sz);
     for (const auto& in : inputs) flat.insert(flat.end(), in.begin(), in.end());
 
     std::lock_guard<std::mutex> lk(mlx_mutex_);
@@ -901,17 +1012,18 @@ std::vector<NNOutput> MlxBackend::evaluate_batch(
         // (it would deadlock).  Instead call forward_batch_nolock directly.
         std::vector<NNOutput> results;
         results.reserve(static_cast<std::size_t>(B));
-        const std::size_t stride = input_size_;
+        const std::size_t stride   = in_sz;
+        const std::size_t fb_psize = policy_size();
         for (int i = 0; i < B; ++i) {
             try {
                 std::vector<float> single(flat.begin() + static_cast<std::ptrdiff_t>(i) * stride,
                                           flat.begin() + static_cast<std::ptrdiff_t>(i + 1) * stride);
                 auto r = forward_batch_nolock(1, single);
                 if (!r.empty()) results.push_back(std::move(r[0]));
-                else { NNOutput fb; fb.policy.assign(engine_policy_size_, 0.0f); results.push_back(fb); }
+                else { NNOutput fb; fb.policy.assign(fb_psize, 0.0f); results.push_back(fb); }
             } catch (...) {
                 NNOutput fb;
-                fb.policy.assign(engine_policy_size_, 0.0f);
+                fb.policy.assign(fb_psize, 0.0f);
                 fb.value = 0.0f; fb.moves_left = 50.0f;
                 results.push_back(std::move(fb));
             }

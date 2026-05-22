@@ -52,8 +52,23 @@ public:
     std::vector<NNOutput> evaluate_batch(const std::vector<std::vector<float>>& inputs) override;
 
     std::string name()        const override;
-    std::size_t input_size()  const override { return input_size_; }
-    std::size_t policy_size() const override { return engine_policy_size_; }
+    // Sizes reported here come from the **sidecar** (config_), not from the
+    // factory-passed defaults.  This is what callers should use when picking
+    // the right traits/protocol pair (e.g. main_chess dispatch).
+    std::size_t input_size()  const override {
+        // Effective input size = seq_len * feat_dim from the sidecar.  Fall
+        // back to the constructor-passed default when the sidecar didn't
+        // populate these (shouldn't happen for any shipped checkpoint).
+        const std::size_t from_sidecar =
+            static_cast<std::size_t>(config_.seq_len) *
+            static_cast<std::size_t>(config_.feat_dim);
+        return from_sidecar > 0 ? from_sidecar : input_size_;
+    }
+    std::size_t policy_size() const override {
+        return config_.num_moves > 0
+            ? static_cast<std::size_t>(config_.num_moves)
+            : engine_policy_size_;
+    }
     bool        batch_preferred() const override { return true; }
 
     // Access loaded config (for diagnostics).
