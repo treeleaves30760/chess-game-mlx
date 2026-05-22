@@ -46,12 +46,60 @@ namespace chess_mlx::search {
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-inline constexpr float kCPuct          = 1.25f;
+//
+// PUCT exploration constant — replaced the old fixed kCPuct=1.25 with a
+// log-growth schedule matching LC0:
+//
+//   cpuct(N) = kCPuctInit + log((N + kCPuctBase) / kCPuctBase)
+//
+// At low N the value sits near kCPuctInit (≈1.25, the AlphaZero default).
+// As N grows the exploration term scales gently with log(N), which is the
+// regime LC0 found to be ~30-60 Elo better than a constant cpuct in real
+// games (especially noticeable in deep MCTS where the AlphaZero recipe
+// stops exploring quickly enough).  The two-parameter form is LC0's
+// `cpuct_init` + `cpuct_base`; we use their published defaults.
+inline constexpr float kCPuctInit      = 1.25f;
+inline constexpr float kCPuctBase      = 19652.0f;
 inline constexpr float kVirtualLoss    = 1.0f;
 inline constexpr float kFpuReduction   = 0.5f;
 inline constexpr float kDirichletAlphaChess = 0.30f;
 inline constexpr float kDirichletAlphaShogi = 0.15f;
 inline constexpr float kDirichletEps   = 0.25f;
+
+// Moves-left head bias (LC0 mlh).
+//
+// When a node has a clearly-winning Q, we prefer children that the NN expects
+// to reach the terminal quickly; when losing we prefer children that drag the
+// game out.  The standard formula (lc0/src/mcts/search.cc):
+//
+//   delta_ml = sign(Q) * (child_ml - parent_ml)
+//   bonus    = kMlhWeight * clip(Q, -kMlhQThresh, kMlhQThresh)
+//                         * clip(delta_ml / kMlhScale, -1, 1)
+//
+// Only kicks in when |Q| > kMlhActivationThresh, so undecided positions
+// behave exactly like before (no bias mixed into the score).  Magnitude is
+// kept under kMlhWeight so it never out-shouts the policy/value signal —
+// the function of mlh is to break ties between equally-good lines.
+inline constexpr float kMlhWeight             = 0.03f;
+inline constexpr float kMlhQThresh            = 1.0f;
+inline constexpr float kMlhScale              = 20.0f;   // plies
+inline constexpr float kMlhActivationThresh   = 0.50f;   // |Q| above this
+
+// Compute the effective cpuct for a parent with N visits.
+//
+// Implemented as a free helper rather than inlining the formula into
+// select_child_puct so that future tuning (e.g. per-game cpuct_base) is a
+// single-call-site change, and so the regression test below can exercise
+// the schedule directly.
+[[nodiscard]] inline double cpuct_at(std::uint32_t N_parent) noexcept {
+    // log1p((N + base) / base - 1) == log((N + base) / base) but slightly
+    // more accurate for tiny N; doesn't matter at our scales — go with the
+    // direct form, which compiles to one log call.
+    const double n = static_cast<double>(N_parent);
+    return static_cast<double>(kCPuctInit)
+         + std::log((n + static_cast<double>(kCPuctBase))
+                    /                static_cast<double>(kCPuctBase));
+}
 
 // ---------------------------------------------------------------------------
 // Time control
@@ -93,23 +141,56 @@ struct TimeControl {
 
 // ---------------------------------------------------------------------------
 // Node — kept small for cache friendliness.  SoA representation using parallel
-// arrays would be marginally tighter; we use AoS for code clarity.  Size: 24
-// bytes on 64-bit (uint32 + uint32 + atomic<uint32> + float + float + int32).
-// The atomic counters push the size a bit.
+// arrays would be marginally tighter; we use AoS for code clarity.  The
+// atomic counters push the size a bit (~40 bytes on 64-bit).
+//
+// Memory-ordering protocol (this is correctness-critical with N worker
+// threads + virtual loss):
+//
+//   * `flags` is the publication gate.  When a writer expands a node it
+//     does, *under tree_mtx_*:
+//         first_child_idx = X;        // plain write
+//         num_children    = N;        // plain write
+//         set_expanded();             // RELEASE-store: bit 0 = 1
+//
+//   * Readers in select_leaf / select_child_puct / build_pv etc. do NOT
+//     take tree_mtx_ for the fast path:
+//         if (is_expanded()) {         // ACQUIRE-load on flags
+//             // synchronises-with the writer's release, so the plain
+//             // writes to first_child_idx / num_children are visible.
+//             read first_child_idx, num_children;
+//         }
+//
+//   * The C++11 release/acquire pair on the same atomic establishes a
+//     happens-before edge that covers the non-atomic writes to
+//     first_child_idx and num_children.  No extra atomics needed on
+//     those fields — they are written exactly once per Node and the
+//     publication gate guarantees visibility.
+//
+//   * is_terminal() / set_terminal() get the same atomic treatment
+//     because a reader may observe bit 1 being set during the same
+//     race window.
 // ---------------------------------------------------------------------------
 struct Node {
     // Index into `nodes_` of the first child.  0 = no children yet.
+    // Plain because publication is gated by the atomic `flags` (see above).
     std::uint32_t first_child_idx{0};
-    // Number of children.
+    // Number of children.  Same publication semantics as first_child_idx.
     std::uint16_t num_children{0};
-    // Flag bits.
-    std::uint16_t flags{0};          // bit0 = expanded, bit1 = terminal
+    // Flag bits.  bit 0 = expanded, bit 1 = terminal.  RELEASE on set,
+    // ACQUIRE on read — gates publication of first_child_idx/num_children.
+    std::atomic<std::uint16_t> flags{0};
     // Visit count (atomic for multi-threaded updates).
     std::atomic<std::uint32_t> visits{0};
     // Virtual-loss count (atomic).
     std::atomic<std::uint32_t> virtual_loss{0};
     // Sum of backpropped values from this node's perspective (atomic via mutex).
     std::atomic<int64_t> value_sum_fp{0};  // stored as fixed-point int64, *1e6
+    // Sum of NN-predicted moves-left, accumulated on backprop.  Stored as
+    // fixed-point int64 so updates are lock-free `fetch_add`s.  Average is
+    // moves_left_sum_fp / (visits * kMlhFpScale).  Updated alongside
+    // value_sum_fp in the backprop loop.
+    std::atomic<int64_t> moves_left_sum_fp{0};
     // Prior probability from the parent's NN policy.
     float prior{0.0f};
     // Move index that leads into this node (from parent).
@@ -122,26 +203,61 @@ struct Node {
     Node(Node&& o) noexcept
         : first_child_idx(o.first_child_idx),
           num_children(o.num_children),
-          flags(o.flags),
-          visits(o.visits.load()),
-          virtual_loss(o.virtual_loss.load()),
-          value_sum_fp(o.value_sum_fp.load()),
+          flags(o.flags.load(std::memory_order_relaxed)),
+          visits(o.visits.load(std::memory_order_relaxed)),
+          virtual_loss(o.virtual_loss.load(std::memory_order_relaxed)),
+          value_sum_fp(o.value_sum_fp.load(std::memory_order_relaxed)),
+          moves_left_sum_fp(o.moves_left_sum_fp.load(std::memory_order_relaxed)),
           prior(o.prior),
           move_policy_idx(o.move_policy_idx) {}
 
     static constexpr int64_t kFpScale = 1000000;
+    // moves_left is a count of plies (typically 0..200), so a 1e3 scale leaves
+    // plenty of headroom in int64 even for a million-visit subtree.
+    static constexpr int64_t kMlhFpScale = 1000;
+
     void   add_value(float v)      { value_sum_fp.fetch_add(static_cast<int64_t>(v * kFpScale), std::memory_order_relaxed); }
+    void   add_moves_left(float m) {
+        moves_left_sum_fp.fetch_add(static_cast<int64_t>(m * kMlhFpScale),
+                                    std::memory_order_relaxed);
+    }
     double avg_value() const {
         const std::uint32_t n = visits.load(std::memory_order_relaxed);
         if (n == 0) return 0.0;
         return static_cast<double>(value_sum_fp.load(std::memory_order_relaxed))
              / (kFpScale * static_cast<double>(n));
     }
+    // Average moves-left from this node's perspective.  Returns -1 when no
+    // visits, so callers can detect the "no data yet" state without
+    // false-positiving on a genuine `0`.
+    double avg_moves_left() const {
+        const std::uint32_t n = visits.load(std::memory_order_relaxed);
+        if (n == 0) return -1.0;
+        return static_cast<double>(moves_left_sum_fp.load(std::memory_order_relaxed))
+             / (kMlhFpScale * static_cast<double>(n));
+    }
 
-    bool is_expanded() const { return (flags & 1u) != 0; }
-    void set_expanded()      { flags = static_cast<std::uint16_t>(flags | 1u); }
-    bool is_terminal() const { return (flags & 2u) != 0; }
-    void set_terminal()      { flags = static_cast<std::uint16_t>(flags | 2u); }
+    // Acquire-load: a true result synchronises-with the writer's release in
+    // `set_expanded()` so subsequent plain reads of first_child_idx /
+    // num_children see the latest values.
+    bool is_expanded() const noexcept {
+        return (flags.load(std::memory_order_acquire) & 1u) != 0;
+    }
+    // Release-store: pairs with `is_expanded()`'s acquire so prior plain
+    // writes to first_child_idx / num_children become visible.  Caller is
+    // expected to be the unique writer for this Node (i.e. holding the
+    // tree mutex or guaranteed to be single-threaded at this point).
+    void set_expanded() noexcept {
+        flags.fetch_or(static_cast<std::uint16_t>(1u),
+                       std::memory_order_release);
+    }
+    bool is_terminal() const noexcept {
+        return (flags.load(std::memory_order_acquire) & 2u) != 0;
+    }
+    void set_terminal() noexcept {
+        flags.fetch_or(static_cast<std::uint16_t>(2u),
+                       std::memory_order_release);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -161,6 +277,13 @@ struct SearchResult {
     std::vector<std::vector<Move>>        top_pvs;
     std::vector<float>                    top_values;    // matched to top_pvs
     std::vector<std::uint32_t>            top_visits;
+    // Per-candidate proven status, from root's stm perspective:
+    //   +1 = the candidate's PV reaches a terminal that wins for root's stm
+    //   -1 = the PV reaches a terminal that loses for root's stm
+    //    0 = unknown / not yet resolved
+    // Used by GUI/UCI layers to emit `score mate N` reliably (without relying
+    // on a transient |q| > threshold check that can flicker mid-search).
+    std::vector<int>                      top_proven_sign;
 };
 
 // ---------------------------------------------------------------------------
@@ -410,16 +533,23 @@ public:
                 static_cast<std::uint32_t>(new_nodes.size());
             old_to_new[old_idx] = new_idx;
 
-            // Move-construct into new_nodes (atomics require explicit load/store).
+            // Copy fields explicitly — atomics require load/store, plain
+            // members are direct assignment.  We're under tree_mtx_ and the
+            // search is stopped, so relaxed memory order is safe everywhere.
             new_nodes.emplace_back();
             Node& dst = new_nodes.back();
             const Node& src = nodes_[old_idx];
-            dst.visits.store(src.visits.load());
-            dst.virtual_loss.store(0);  // reset virtual loss on promotion
-            dst.value_sum_fp.store(src.value_sum_fp.load());
+            dst.visits      .store(src.visits      .load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+            dst.virtual_loss.store(0u, std::memory_order_relaxed);  // reset on promotion
+            dst.value_sum_fp.store(src.value_sum_fp.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+            dst.moves_left_sum_fp.store(src.moves_left_sum_fp.load(std::memory_order_relaxed),
+                                        std::memory_order_relaxed);
             dst.prior            = src.prior;
             dst.move_policy_idx  = src.move_policy_idx;
-            dst.flags            = src.flags;
+            dst.flags           .store(src.flags.load(std::memory_order_relaxed),
+                                       std::memory_order_relaxed);
             dst.num_children     = src.num_children;
             dst.first_child_idx  = src.first_child_idx;  // will be patched below
 
@@ -442,7 +572,10 @@ public:
                 // Children not captured in BFS (should not happen).
                 n.num_children   = 0;
                 n.first_child_idx = 0;
-                n.flags = static_cast<std::uint16_t>(n.flags & ~1u);  // unexpand
+                // Unexpand: clear bit 0.  Single-writer here (we hold
+                // tree_mtx_ and no workers run), so relaxed is fine.
+                n.flags.fetch_and(static_cast<std::uint16_t>(~1u),
+                                  std::memory_order_relaxed);
             }
         }
 
@@ -564,7 +697,9 @@ private:
 
         // Submit to batcher (or direct evaluate if single-threaded / no batch).
         if (cfg_.threads > 1 && backend_->batch_preferred()) {
-            pl.fut = batcher_.submit(pl.input_enc);
+            // Move so the batcher owns the buffer; drain_leaf() doesn't need
+            // to read input_enc again once submission is queued.
+            pl.fut = batcher_.submit(std::move(pl.input_enc));
         }
         // else: we'll call backend_->evaluate() synchronously in drain_leaf().
 
@@ -575,12 +710,22 @@ private:
     // Drain phase: wait for the future (if any), install children, backprop.
     // -----------------------------------------------------------------------
     void drain_leaf(PendingLeaf& pl, const Position& /*root_pos*/) {
-        float leaf_value = 0.0f;
+        float leaf_value      = 0.0f;
+        // Terminal leaves resolve in 0 plies; already-expanded leaves reuse
+        // the running average we'd compute below if we re-queried.  For both
+        // we feed in 0 — the moves-left bias only affects PUCT once a
+        // genuine NN estimate has been backpropped through, which is the
+        // common case.
+        float leaf_moves_left = 0.0f;
 
         if (pl.is_terminal_leaf) {
             leaf_value = pl.terminal_value;
         } else if (pl.already_expanded) {
             leaf_value = pl.already_value;
+            // Recover the running moves_left estimate so the bias keeps
+            // pointing in a sensible direction for racing-expansion leaves.
+            const double aml = nodes_[pl.leaf_idx].avg_moves_left();
+            if (aml >= 0.0) leaf_moves_left = static_cast<float>(aml);
         } else {
             // Get NN output.
             nn::NNOutput nn_out;
@@ -596,9 +741,9 @@ private:
             float max_logit = -std::numeric_limits<float>::infinity();
             for (std::size_t i = 0; i < n_moves; ++i) {
                 const int p = pl.policy_idxs[i];
-                const float l = (p >= 0 &&
-                    static_cast<std::size_t>(p) < nn_out.policy.size())
-                    ? nn_out.policy[static_cast<std::size_t>(p)] : 0.0f;
+                const float l = (p >= 0)
+                    ? nn_out.policy_at(static_cast<std::size_t>(p))
+                    : 0.0f;
                 priors[i] = l;
                 if (l > max_logit) max_logit = l;
             }
@@ -631,19 +776,35 @@ private:
                     nodes_[pl.leaf_idx].set_expanded();
                 }
             }
-            leaf_value = nn_out.value;
+            leaf_value      = nn_out.value;
+            leaf_moves_left = nn_out.moves_left;
         }
 
-        // Backprop.
-        float v = leaf_value;
+        // Backprop. Order: value_sum then visits. The reporter thread reads
+        // avg = value_sum / visits between these two atomic ops; if visits
+        // advanced first we'd see value_sum / (n+1) which transiently biases
+        // |avg| < 1 even for a proven-win subtree, breaking the mate detection
+        // in build_result + uci emit_info. Updating value_sum first means a
+        // racing read overshoots (avg = new_sum / old_visits), which is the
+        // safer direction for the |avg| >= kProvenWinThreshold check.
+        //
+        // moves_left is independent — every ancestor sees the same plies-
+        // remaining count (it isn't sign-flipped on each ply since "plies
+        // until terminal" is the same number from either side's view).
+        // We grow it by +1 per ancestor step to reflect the extra move
+        // they would each play before reaching the leaf.
+        float v  = leaf_value;
+        float ml = leaf_moves_left;
         for (auto it = pl.path.rbegin(); it != pl.path.rend(); ++it) {
             const auto idx = *it;
-            nodes_[idx].visits.fetch_add(1, std::memory_order_relaxed);
             nodes_[idx].add_value(v);
+            nodes_[idx].add_moves_left(ml);
+            nodes_[idx].visits.fetch_add(1, std::memory_order_relaxed);
             if (idx != 0) {
                 nodes_[idx].virtual_loss.fetch_sub(1, std::memory_order_relaxed);
             }
-            v = -v;
+            v   = -v;
+            ml += 1.0f;
         }
 
         // Node-count termination.
@@ -707,8 +868,33 @@ private:
         }
 
         // Steady-state: drain oldest, submit new.
+        //
+        // We keep going until should_stop() — we must NOT exit just because the
+        // pipeline drained.  In a resolved subtree (e.g. a found forced mate)
+        // select_leaf keeps returning terminal leaves that drain_sync_back pops
+        // immediately, so `pending` empties even though the search isn't over.
+        // Exiting there is the bug that made `go infinite` self-terminate after
+        // a few hundred nodes in won endgames (all workers bailed, search ended)
+        // and starved the search of the visits it needs to converge on the
+        // shortest mate.
         while (!should_stop() || !pending.empty()) {
-            if (pending.empty()) break;
+            if (pending.empty()) {
+                if (should_stop()) break;
+                // Re-prime.  If every selection resolves to a terminal /
+                // already-expanded leaf, drain_sync_back empties them right away
+                // and `pending` stays empty; back off briefly so we don't peg
+                // every core spinning on a fully-solved position under
+                // `go infinite`.
+                while (!should_stop() &&
+                       static_cast<int>(pending.size()) < pipeline_depth) {
+                    pending.push_back(select_leaf(root_pos));
+                    drain_sync_back();
+                }
+                if (pending.empty() && !should_stop()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+                continue;
+            }
 
             // Drain the front (oldest) pending leaf — blocks until future ready.
             drain_leaf(pending.front(), root_pos);
@@ -755,26 +941,31 @@ private:
             }
 
             // 2. Expand & evaluate
-            float leaf_value = 0.0f;
+            float leaf_value      = 0.0f;
+            float leaf_moves_left = 0.0f;
             if (nodes_[cur].is_terminal()) {
                 leaf_value = terminal_stm_value(pos);
             } else if (Rules::is_terminal(pos)) {
                 nodes_[cur].set_terminal();
                 leaf_value = terminal_stm_value(pos);
             } else {
-                leaf_value = expand_node(cur, pos);
+                leaf_value = expand_node(cur, pos, &leaf_moves_left);
             }
 
-            // 3. Backprop
-            float v = leaf_value;
+            // 3. Backprop — value_sum first, then visits (see drain_leaf).
+            //    moves_left grows by +1 per ancestor (see drain_leaf comment).
+            float v  = leaf_value;
+            float ml = leaf_moves_left;
             for (auto it = path.rbegin(); it != path.rend(); ++it) {
                 auto idx = *it;
-                nodes_[idx].visits.fetch_add(1, std::memory_order_relaxed);
                 nodes_[idx].add_value(v);
+                nodes_[idx].add_moves_left(ml);
+                nodes_[idx].visits.fetch_add(1, std::memory_order_relaxed);
                 if (idx != 0) {
                     nodes_[idx].virtual_loss.fetch_sub(1, std::memory_order_relaxed);
                 }
-                v = -v;
+                v   = -v;
+                ml += 1.0f;
             }
 
             const std::uint64_t n =
@@ -832,6 +1023,10 @@ private:
 
         const std::uint32_t N_parent = parent.visits.load(std::memory_order_relaxed);
         const double sqrt_n = std::sqrt(static_cast<double>(std::max<std::uint32_t>(1, N_parent)));
+        // Log-growth cpuct: see cpuct_at() / kCPuctInit / kCPuctBase comments
+        // at the top of this file.  Computed once per call (depends only on
+        // the parent's visit count, not the child's).
+        const double cpuct = cpuct_at(N_parent);
 
         // FPU reduction: compute sum of visited priors.
         double sum_p_visited = 0.0;
@@ -840,7 +1035,8 @@ private:
             if (c.visits.load(std::memory_order_relaxed) > 0)
                 sum_p_visited += c.prior;
         }
-        const double parent_q = parent.avg_value();
+        const double parent_q  = parent.avg_value();
+        const double parent_ml = parent.avg_moves_left();  // -1 if no visits
         const double fpu_reduced_q = parent_q - kFpuReduction * std::sqrt(sum_p_visited);
 
         double best_score = -std::numeric_limits<double>::infinity();
@@ -864,9 +1060,39 @@ private:
                 // the denominator, which biases Q toward 0 for busy children.
                 // That's fine per the standard virtual-loss recipe.
             }
-            const double u = kCPuct * static_cast<double>(c.prior)
+            const double u = cpuct * static_cast<double>(c.prior)
                              * sqrt_n / (1.0 + static_cast<double>(Nc + vl));
-            const double score = q + u;
+
+            // -------------------------------------------------------------
+            // Moves-left bias (LC0 mlh).  See kMlh* comments at top of file.
+            //
+            // Active only when Q is decisively non-zero (|Q| > activation)
+            // AND the child has at least one visit (so avg_moves_left is
+            // meaningful).  Sign convention:
+            //
+            //   winning  (Q > 0) → prefer SHORT child_ml  → bias negative when child_ml > parent_ml
+            //   losing   (Q < 0) → prefer LONG  child_ml  → bias positive when child_ml > parent_ml
+            //
+            // We frame both cases as a single bias = w * Q * (delta_ml/scale),
+            // signed so larger child_ml → smaller score when winning, larger
+            // when losing — which falls out of multiplying by Q.
+            // -------------------------------------------------------------
+            double mlh_bias = 0.0;
+            if (Nc > 0 && std::abs(q) > kMlhActivationThresh && parent_ml >= 0.0) {
+                const double child_ml = c.avg_moves_left();
+                if (child_ml >= 0.0) {
+                    double delta = (child_ml - parent_ml) / kMlhScale;
+                    if (delta >  1.0) delta =  1.0;
+                    if (delta < -1.0) delta = -1.0;
+                    double q_clipped = q;
+                    if (q_clipped >  kMlhQThresh) q_clipped =  kMlhQThresh;
+                    if (q_clipped < -kMlhQThresh) q_clipped = -kMlhQThresh;
+                    // -q so that winning + long child_ml → negative bias.
+                    mlh_bias = -static_cast<double>(kMlhWeight) * q_clipped * delta;
+                }
+            }
+
+            const double score = q + u + mlh_bias;
             if (score > best_score) {
                 best_score = score;
                 best_idx   = i;
@@ -889,11 +1115,22 @@ private:
 
     // -----------------------------------------------------------------------
     // Node expansion: evaluate NN on leaf, create children.
-    // Returns leaf value from stm perspective.
+    // Returns leaf value from stm perspective.  If `out_moves_left` is
+    // non-null, the NN's moves-left estimate is written there (only used by
+    // worker_loop_simple — the pipelined drain_leaf path reads moves_left
+    // directly from NNOutput).
     // -----------------------------------------------------------------------
-    float expand_node(std::uint32_t idx, const Position& pos) {
+    float expand_node(std::uint32_t idx, const Position& pos,
+                       float* out_moves_left = nullptr) {
+        auto set_ml = [&](float v) { if (out_moves_left) *out_moves_left = v; };
+
         // Early out if another thread already expanded this node.
-        if (nodes_[idx].is_expanded()) return static_cast<float>(nodes_[idx].avg_value());
+        if (nodes_[idx].is_expanded()) {
+            const double aml = nodes_[idx].avg_moves_left();
+            if (aml >= 0.0) set_ml(static_cast<float>(aml));
+            else            set_ml(0.0f);
+            return static_cast<float>(nodes_[idx].avg_value());
+        }
 
         // Generate legal moves (cheap; repeated work is OK across racing expands).
         core::MoveList<Move> ml;
@@ -904,6 +1141,7 @@ private:
                 nodes_[idx].set_expanded();
                 nodes_[idx].set_terminal();
             }
+            set_ml(0.0f);  // terminal: zero plies remaining.
             return terminal_stm_value(pos);
         }
 
@@ -927,8 +1165,9 @@ private:
         for (std::size_t i = 0; i < ml.size(); ++i) {
             const int p = Traits::move_to_policy_idx(ml[i], pos);
             idxs[i] = p;
-            const float l = (p >= 0 && static_cast<std::size_t>(p) < nn_out.policy.size())
-                          ? nn_out.policy[static_cast<std::size_t>(p)] : 0.0f;
+            const float l = (p >= 0)
+                          ? nn_out.policy_at(static_cast<std::size_t>(p))
+                          : 0.0f;
             priors[i] = l;
             if (l > max_logit) max_logit = l;
         }
@@ -945,12 +1184,16 @@ private:
         // Reserve + install children under the tree lock; re-check for races.
         {
             std::lock_guard<std::mutex> lk(tree_mtx_);
-            if (nodes_[idx].is_expanded()) return nn_out.value;
+            if (nodes_[idx].is_expanded()) {
+                set_ml(nn_out.moves_left);
+                return nn_out.value;
+            }
 
             // Capacity guard: if we'd exceed the pool, mark terminal and
             // return NN value.  This caps tree growth rather than crashing.
             if (nodes_.size() + ml.size() > nodes_.capacity()) {
                 nodes_[idx].set_expanded();
+                set_ml(nn_out.moves_left);
                 return nn_out.value;
             }
 
@@ -966,6 +1209,7 @@ private:
             nodes_[idx].set_expanded();
         }
 
+        set_ml(nn_out.moves_left);
         return nn_out.value;  // NN value is already stm-relative by convention
     }
 
@@ -1000,41 +1244,112 @@ private:
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - start_time_).count());
 
+        // Hold the tree lock for the whole snapshot.  The reporter thread calls
+        // build_result every ~250 ms while workers may be resizing nodes_ (a
+        // reallocation that invalidates every reference/index we read here).
+        // The per-Node acquire/release protocol guards individual fields but
+        // NOT the vector reallocation, so without this lock build_pv's walk can
+        // dereference freed memory — a real, if rare, crash, made more likely
+        // now that we build a PV for every candidate below.  Workers only hold
+        // tree_mtx_ briefly (to install children), so the contention is small.
+        std::lock_guard<std::mutex> lk(tree_mtx_);
+
         const Node& root = nodes_[0];
         if (root.num_children == 0) return r;
 
-        // Collect (child index, visits, mean_q, move) tuples.
+        // Collect (child index, visits, mean_q, move, proven info) tuples.
         struct Candidate {
-            std::uint32_t idx;
-            std::uint32_t visits;
-            double        q;
-            Move          move;
+            std::uint32_t      idx;
+            std::uint32_t      visits;
+            double             q;
+            Move               move;
+            std::vector<Move>  pv;            // most-visited PV from this child
+            int                proven_sign{0};// +1 win / -1 loss / 0 unknown (root stm)
+            int                mate_dist{0};  // plies to terminal when proven
         };
         std::vector<Candidate> cands;
         cands.reserve(root.num_children);
         for (std::uint16_t i = 0; i < root.num_children; ++i) {
             const Node& c = nodes_[root.first_child_idx + i];
+            const int p = c.move_policy_idx;
+            if (p < 0) continue;  // skip unmapped children (defensive: no null PV)
             Candidate cd;
             cd.idx    = root.first_child_idx + i;
             cd.visits = c.visits.load(std::memory_order_relaxed);
             cd.q      = -c.avg_value();  // child's q from root's perspective
-            const int p = c.move_policy_idx;
-            cd.move   = (p >= 0) ? Traits::policy_idx_to_move(p, root_pos) : Move{};
-            cands.push_back(cd);
+            cd.move   = Traits::policy_idx_to_move(p, root_pos);
+            // Probe the most-visited path ONCE: yields the proven win/loss flag
+            // and, when proven, the distance in plies to the terminal.  Reused
+            // for both the sort and the MultiPV output below, so build_pv runs
+            // exactly once per candidate.
+            cd.pv = build_pv(cd.idx, root_pos, cd.move, &cd.proven_sign);
+            cd.mate_dist = (cd.proven_sign != 0)
+                ? static_cast<int>(cd.pv.size())
+                : std::numeric_limits<int>::max();
+            cands.push_back(std::move(cd));
         }
-        // Proven-win first, then visits desc, then q desc.
-        // A candidate with q ≥ kProvenWinThreshold has had its subtree resolved
-        // to a forced win for the side to move; we must never lose such a move
-        // to a non-mating candidate that simply accumulated more visits.
+        if (cands.empty()) return r;
+        // Sort order, applied top-down:
+        //
+        //   1. Proven win (q ≥ kProvenWinThreshold) → first.  The subtree is
+        //      resolved to a forced win for root's stm and must never be lost
+        //      to a non-mating candidate that simply accumulated more visits.
+        //   2. Proven loss (q ≤ -kProvenWinThreshold) → last.  These are
+        //      forced-loss subtrees the search has resolved; we never want a
+        //      proven-loss move to surface as bestmove just because the
+        //      policy network sent visits its way before the loss was seen.
+        //   3. Q-quality bucket: candidates within `kQBucketDelta` of the top
+        //      non-proven Q are treated as "competitive"; non-competitive
+        //      moves are demoted regardless of visit count.  Without this
+        //      step a high-prior mediocre move (lots of visits, q ≈ 0) can
+        //      shadow a sharper line whose q is materially higher, causing
+        //      the displayed eval to flicker (e.g. +2.30 dropping to +0.00
+        //      when the visit-leader swaps in).
+        //   4. Within bucket: visits desc, then q desc.  This keeps the
+        //      AlphaZero-canonical visit-based selection among moves that
+        //      are roughly equally good in Q.
         constexpr double kProvenWinThreshold = 0.99;
-        std::sort(cands.begin(), cands.end(), [](const Candidate& a, const Candidate& b) {
-            const bool a_proven = a.q >= kProvenWinThreshold;
-            const bool b_proven = b.q >= kProvenWinThreshold;
-            if (a_proven != b_proven) return a_proven;
-            if (a_proven) {
+        constexpr double kQBucketDelta       = 0.30;
+
+        // Compute the top Q among non-proven-win candidates so the bucket
+        // threshold is independent of the proven-win bump above.
+        double max_q_unproven = -2.0;
+        for (const auto& c : cands) {
+            if (c.q < kProvenWinThreshold) {
+                max_q_unproven = std::max(max_q_unproven, c.q);
+            }
+        }
+        const double q_bucket_floor = max_q_unproven - kQBucketDelta;
+
+        std::sort(cands.begin(), cands.end(),
+                  [&](const Candidate& a, const Candidate& b) {
+            const bool a_pw = a.q >=  kProvenWinThreshold;
+            const bool b_pw = b.q >=  kProvenWinThreshold;
+            if (a_pw != b_pw) return a_pw;
+            if (a_pw) {
+                // Both proven wins → play the FASTEST mate.  mate_dist is the
+                // ply count along the proven PV (INT_MAX when the win wasn't
+                // confirmed terminal within the walk, so confirmed short mates
+                // sort ahead of "winning but unproven-distance" lines).  This is
+                // what makes the engine actually deliver the mate instead of
+                // shuffling around a won position until the 50-move rule.
+                if (a.mate_dist != b.mate_dist) return a.mate_dist < b.mate_dist;
                 if (a.q != b.q) return a.q > b.q;
                 return a.visits > b.visits;
             }
+            const bool a_pl = a.q <= -kProvenWinThreshold;
+            const bool b_pl = b.q <= -kProvenWinThreshold;
+            if (a_pl != b_pl) return !a_pl;  // non-loss first
+            if (a_pl) {
+                // Both proven losses → drag it out: prefer the LONGEST line so
+                // the opponent has the most chances to err.
+                if (a.mate_dist != b.mate_dist) return a.mate_dist > b.mate_dist;
+                if (a.q != b.q) return a.q > b.q;
+                return a.visits > b.visits;
+            }
+            const bool a_competitive = a.q >= q_bucket_floor;
+            const bool b_competitive = b.q >= q_bucket_floor;
+            if (a_competitive != b_competitive) return a_competitive;
             if (a.visits != b.visits) return a.visits > b.visits;
             return a.q > b.q;
         });
@@ -1046,12 +1361,14 @@ private:
         r.top_pvs.reserve(static_cast<std::size_t>(kmax));
         r.top_values.reserve(static_cast<std::size_t>(kmax));
         r.top_visits.reserve(static_cast<std::size_t>(kmax));
+        r.top_proven_sign.reserve(static_cast<std::size_t>(kmax));
 
         for (int k = 0; k < kmax; ++k) {
-            r.top_pvs.emplace_back(build_pv(cands[static_cast<std::size_t>(k)].idx, root_pos,
-                                            cands[static_cast<std::size_t>(k)].move));
-            r.top_values.push_back(static_cast<float>(cands[static_cast<std::size_t>(k)].q));
-            r.top_visits.push_back(cands[static_cast<std::size_t>(k)].visits);
+            auto& cd = cands[static_cast<std::size_t>(k)];
+            r.top_pvs.push_back(std::move(cd.pv));     // precomputed above
+            r.top_values.push_back(static_cast<float>(cd.q));
+            r.top_visits.push_back(cd.visits);
+            r.top_proven_sign.push_back(cd.proven_sign);
         }
 
         // Selection-depth estimate: walk best path from root.
@@ -1086,13 +1403,23 @@ private:
     }
 
     // Build a single PV by repeatedly selecting the most-visited child.
+    //
+    // If `out_proven_sign` is non-null and the PV walks into a terminal node,
+    // it is set to the terminal value from ROOT'S stm perspective:
+    //    +1 = win for root's stm, -1 = loss, 0 = draw / not terminal / unknown.
+    // This is the canonical "proven mate" signal callers should use instead
+    // of |q| > 0.99, which is racy under concurrent backprop.
     std::vector<Move> build_pv(std::uint32_t start_idx,
                                 const Position& root_pos,
-                                const Move& first_move) {
+                                const Move& first_move,
+                                int* out_proven_sign = nullptr) {
         std::vector<Move> pv;
         pv.push_back(first_move);
         Position tmp = root_pos;
         Rules::apply(tmp, first_move);
+        // Each applied move flips the side-to-move; track the parity so we can
+        // map a leaf's stm-relative terminal value back to root's stm.
+        int plies_applied = 1;
 
         std::uint32_t cur = start_idx;
         for (int d = 0; d < 64; ++d) {
@@ -1112,7 +1439,28 @@ private:
             Move m = Traits::policy_idx_to_move(p_idx, tmp);
             pv.push_back(m);
             Rules::apply(tmp, m);
+            ++plies_applied;
             cur = next;
+        }
+
+        if (out_proven_sign != nullptr) {
+            *out_proven_sign = 0;
+            // Terminal at the PV leaf? Two paths set the flag:
+            //   * the Node itself was marked terminal during search, or
+            //   * the position has no legal moves (catches the case where
+            //     the PV ran into a leaf that wasn't expanded yet but is
+            //     in fact mate / stalemate).
+            const bool node_terminal = nodes_[cur].is_terminal();
+            const bool pos_terminal  = node_terminal || Rules::is_terminal(tmp);
+            if (pos_terminal) {
+                // terminal_stm_value returns value from tmp's stm. Convert to
+                // root's stm: odd plies → sign flip, even plies → same sign.
+                const float tv = terminal_stm_value(tmp);
+                const float root_tv = (plies_applied % 2 == 0) ? tv : -tv;
+                if      (root_tv >  0.99f) *out_proven_sign = +1;
+                else if (root_tv < -0.99f) *out_proven_sign = -1;
+                // |root_tv| ≤ 0.99 (i.e. draw) → leave 0.
+            }
         }
         return pv;
     }

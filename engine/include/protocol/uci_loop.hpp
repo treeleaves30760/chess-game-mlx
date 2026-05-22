@@ -363,15 +363,32 @@ private:
             oss << " multipv " << (k + 1);
             const float stm_v = r.top_values[static_cast<std::size_t>(k)];
             const float white_v = root_stm_is_white_ ? stm_v : -stm_v;
-            // Forced-mate threshold: when MCTS has resolved a subtree to a
-            // certain win/loss, |stm_v| approaches 1.0. Emit `score mate N`
-            // so GUIs can surface a "Mate in N" indicator instead of a giant
-            // centipawn score.
+            // Forced-mate detection. Two channels:
+            //   * `top_proven_sign[k]` — set by build_pv when the PV reaches
+            //     a terminal node, expressed in root's stm. This is the
+            //     authoritative signal: it doesn't flicker with backprop
+            //     races the way |q| does.
+            //   * |white_v| > 0.99 — legacy threshold, kept as a fallback in
+            //     case the PV walk didn't reach the terminal (e.g. tree was
+            //     truncated by node-pool capacity).
+            const int proven_root = (k < static_cast<int>(r.top_proven_sign.size()))
+                                    ? r.top_proven_sign[static_cast<std::size_t>(k)]
+                                    : 0;
             constexpr float kMateValueThreshold = 0.99f;
-            if (std::abs(white_v) > kMateValueThreshold) {
+            const bool is_mate =
+                proven_root != 0 || std::abs(white_v) > kMateValueThreshold;
+            if (is_mate) {
                 const int mate_in = std::max(
                     1, static_cast<int>((pv.size() + 1) / 2));
-                const int sign = (white_v > 0.0f) ? 1 : -1;
+                // Mate sign emitted in white-perspective (matches the cp
+                // channel and the GUI's eval bar). proven_root is in root's
+                // stm — flip to white-perspective when black is to move.
+                int sign;
+                if (proven_root != 0) {
+                    sign = root_stm_is_white_ ? proven_root : -proven_root;
+                } else {
+                    sign = (white_v > 0.0f) ? 1 : -1;
+                }
                 oss << " score mate " << (sign * mate_in);
             } else {
                 const int cp = value_to_cp(white_v);

@@ -26,6 +26,22 @@ static std::shared_ptr<StubBackend> make_stub() {
     return std::make_shared<StubBackend>(/*policy_size=*/4672, /*input_size=*/64 * 19);
 }
 
+// A StubBackend that reports batch_preferred() == true, so MCTS exercises the
+// PIPELINED worker_loop (with the Batcher) instead of worker_loop_simple. The
+// plain StubBackend leaves batch_preferred() at its false default, so the other
+// tests here never touch the pipelined path — which is exactly where the
+// "search self-terminates on a resolved mate" bug lived.
+class BatchStubBackend : public StubBackend {
+public:
+    using StubBackend::StubBackend;
+    bool batch_preferred() const override { return true; }
+};
+
+static std::shared_ptr<BatchStubBackend> make_batch_stub() {
+    return std::make_shared<BatchStubBackend>(/*policy_size=*/4672,
+                                              /*input_size=*/64 * 19);
+}
+
 // ----------------------------------------------------------------------------
 // With StubBackend on startpos: search returns a legal move.
 // ----------------------------------------------------------------------------
@@ -161,6 +177,90 @@ TEST(MCTSChess, MultiThreadNoCrash) {
 }
 
 // ----------------------------------------------------------------------------
+// Publication race regression for Node::flags.
+//
+// One writer expands a fresh Node `kIters` times with a monotonically
+// increasing pattern in first_child_idx / num_children.  One reader polls
+// is_expanded() and, on every observed expansion, must see the matching
+// pattern — never a stale 0 from a previous reset.
+//
+// Ping-pong cadence: writer publishes → reader observes → reader ACKs →
+// writer clears → reader waits for clear → loop.  The ACK is a separate
+// atomic so we never spin on the SAME atomic we're mutating, which would
+// trivially defeat the test on x86's strong memory model.
+//
+// Pre-fix (plain `flags` with relaxed loads) the reader regularly sees
+// is_expanded()=true while first_child_idx / num_children are still 0
+// under TSan and on weakly-ordered hardware (arm64).  Post-fix the
+// stale_reads counter stays at 0.
+// ----------------------------------------------------------------------------
+TEST(MCTSChess, NodePublicationVisibility) {
+    using chess_mlx::search::Node;
+
+    constexpr int kIters = 10000;
+
+    Node node;
+    std::atomic<int> next_pub  {0};   // writer increments after publishing
+    std::atomic<int> last_ack  {0};   // reader increments after observing
+    std::atomic<int> stale_reads{0};
+
+    std::thread writer([&]() {
+        for (int i = 1; i <= kIters; ++i) {
+            // Wait for reader to ACK the previous publication.
+            while (last_ack.load(std::memory_order_acquire) < i - 1) {
+                std::this_thread::yield();
+            }
+            // Plain writes — must NOT be reorderable past the release-store
+            // below, which is the whole point of the protocol.
+            node.first_child_idx = static_cast<std::uint32_t>(i);
+            node.num_children    = static_cast<std::uint16_t>((i & 0x0FFF) | 0x1000);
+            node.set_expanded();              // RELEASE
+            next_pub.store(i, std::memory_order_release);
+
+            // Wait until reader saw it before we reset for the next round.
+            while (last_ack.load(std::memory_order_acquire) < i) {
+                std::this_thread::yield();
+            }
+            // Clear for next iter — reader is between iterations.
+            node.flags.store(0, std::memory_order_relaxed);
+            node.first_child_idx = 0;
+            node.num_children    = 0;
+        }
+    });
+
+    std::thread reader([&]() {
+        for (int i = 1; i <= kIters; ++i) {
+            // Wait for the next publication via the side-channel counter so
+            // we don't spin on the same atomic the writer is racing on.
+            while (next_pub.load(std::memory_order_acquire) < i) {
+                std::this_thread::yield();
+            }
+            // ACQUIRE on the publication gate; the matching plain reads
+            // below must see the writer's monotonic pattern.
+            const bool expanded = node.is_expanded();
+            const auto fc = node.first_child_idx;
+            const auto nc = node.num_children;
+            const bool consistent =
+                expanded &&
+                static_cast<int>(fc) == i &&
+                ((nc & 0x0FFF) == (i & 0x0FFF)) &&
+                ((nc & 0xF000) == 0x1000);
+            if (!consistent) {
+                stale_reads.fetch_add(1, std::memory_order_relaxed);
+            }
+            last_ack.store(i, std::memory_order_release);
+        }
+    });
+
+    writer.join();
+    reader.join();
+
+    EXPECT_EQ(stale_reads.load(), 0)
+        << "Observed is_expanded()=true with stale first_child_idx / "
+           "num_children — Node::flags publication contract broken.";
+}
+
+// ----------------------------------------------------------------------------
 // Internal MCTS threading: one search with threads=4 must return a legal move.
 // ----------------------------------------------------------------------------
 TEST(MCTSChess, InternalMultiThread) {
@@ -181,6 +281,35 @@ TEST(MCTSChess, InternalMultiThread) {
     for (const auto& m : ml) if (m == result.best_move) { found = true; break; }
     EXPECT_TRUE(found);
     EXPECT_GT(result.nodes, 0u);
+}
+
+// ----------------------------------------------------------------------------
+// Regression: the PIPELINED worker_loop must not self-terminate on a position
+// whose tree resolves to terminals (a forced mate).  Pre-fix, every worker
+// drained its pipeline (select_leaf kept returning terminal leaves that were
+// popped synchronously) and exited via `if (pending.empty()) break;`, so a
+// search bailed after a few hundred nodes — starving won endgames of the visits
+// they need and making `go infinite` finish on its own.  Post-fix the search
+// runs until its node budget.
+// ----------------------------------------------------------------------------
+TEST(MCTSChess, PipelinedSearchUsesFullBudgetOnResolvedMate) {
+    auto backend = make_batch_stub();  // batch_preferred() == true → pipelined
+    MCTS<ChessTraits>::Config cfg;
+    cfg.threads = 4;
+    cfg.multipv = 3;
+    MCTS<ChessTraits> mcts(backend, cfg);
+
+    TimeControl tc;
+    tc.max_nodes = 4000;
+
+    // Mate-in-1: the tree near the root resolves to a terminal almost at once.
+    ChessPosition pos("k7/7R/1K6/8/8/8/8/8 w - - 0 1");
+    auto result = mcts.search(pos, tc);
+
+    EXPECT_GE(result.nodes, 3000u)
+        << "pipelined search bailed early on a resolved mate (nodes="
+        << result.nodes << ", budget=4000) — worker_loop exited on empty pipeline";
+    EXPECT_FALSE(result.best_move.is_null());
 }
 
 // ----------------------------------------------------------------------------
@@ -224,6 +353,65 @@ TEST(MCTSChess, MultiPVReturnsK) {
 
     EXPECT_EQ(result.top_pvs.size(), 3u);
     for (auto& pv : result.top_pvs) EXPECT_FALSE(pv.empty());
+}
+
+// ----------------------------------------------------------------------------
+// Forced-mate signal: on a mate-in-1, the top candidate's PV walks into a
+// terminal node and build_result must mark top_proven_sign[0] == +1 (win for
+// the side to move).  This is the signal the UCI layer uses to emit `score
+// mate N` reliably instead of a flaky |q| > 0.99 threshold check.
+// ----------------------------------------------------------------------------
+TEST(MCTSChess, MateInOneSetsProvenSign) {
+    // White plays Rh8# (rook a1->a8 in some FENs; here h7->h8 from K..k file).
+    ChessPosition pos("k7/7R/1K6/8/8/8/8/8 w - - 0 1");
+
+    // Identify the mating move so we can assert the PV starts with it.
+    core::MoveList<ChessMove> ml;
+    ChessTraits::generate_legal(pos, ml);
+    ChessMove mating;
+    for (const auto& m : ml) {
+        ChessPosition tmp = pos;
+        ChessTraits::apply(tmp, m);
+        const auto [reason, result] = tmp.board.isGameOver();
+        if (result == ::chess::GameResult::LOSE) { mating = m; break; }
+    }
+    ASSERT_FALSE(mating.is_null()) << "Test prerequisite: position is mate-in-1";
+
+    auto backend = make_stub();
+    MCTS<ChessTraits>::Config cfg;
+    cfg.threads  = 1;
+    cfg.multipv  = 3;
+    MCTS<ChessTraits> mcts(backend, cfg);
+    TimeControl tc;
+    tc.max_nodes = 5000;
+
+    auto result = mcts.search(pos, tc);
+
+    ASSERT_FALSE(result.top_pvs.empty());
+    ASSERT_FALSE(result.top_proven_sign.empty());
+    EXPECT_EQ(result.best_move, mating);
+    EXPECT_EQ(result.top_pvs[0].front(), mating);
+    EXPECT_EQ(result.top_proven_sign[0], +1)
+        << "Mate-in-1 PV should be flagged proven-win for the side to move";
+}
+
+// ----------------------------------------------------------------------------
+// Non-terminal positions carry no proven flag (sign == 0 for all candidates).
+// ----------------------------------------------------------------------------
+TEST(MCTSChess, StartposHasNoProvenSign) {
+    auto backend = make_stub();
+    MCTS<ChessTraits>::Config cfg;
+    cfg.threads = 1;
+    cfg.multipv = 3;
+    MCTS<ChessTraits> mcts(backend, cfg);
+    TimeControl tc;
+    tc.max_nodes = 500;
+
+    ChessPosition pos;
+    auto result = mcts.search(pos, tc);
+
+    ASSERT_EQ(result.top_proven_sign.size(), result.top_pvs.size());
+    for (int s : result.top_proven_sign) EXPECT_EQ(s, 0);
 }
 
 // ----------------------------------------------------------------------------
