@@ -6,4 +6,5 @@
 	url = https://github.com/ml-explore/mlx-c.git
 [submodule "engine/third_party/cshogi-upstream"]
 	path = engine/third_party/cshogi-upstream
-	url = https://github.com/TadaoYamaoka/cshogi.git
+	url = https://github.com/treeleaves30760/cshogi.git
+	branch = apple-clang-build
