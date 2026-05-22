@@ -297,6 +297,12 @@ class GameScene:
         self._selected_square: int | None = None
         self._chess_pending_promo: _ChessPendingPromotion | None = None
         self._chess_promo_buttons: dict[str, pygame.Rect] = {}
+        # Tracks move-history length so we can detect any position change
+        # (human move, engine bestmove applied, undo, new_game) from a single
+        # chokepoint. On change we drop the analysis panel's sticky mate state
+        # and stale top-3 so the GUI doesn't carry stale info onto the new
+        # position.
+        self._last_move_count = len(self._controller.state.move_history)
 
     # ------------------------------------------------------------------
     # Mode helpers
@@ -476,11 +482,35 @@ class GameScene:
         return GameSceneAction.NONE
 
     def process_engine_events(self) -> None:
+        # Detect any position change first (human move from handle_event last
+        # frame, or an engine bestmove about to be applied below) so a stale
+        # mate banner / top-3 is cleared before fresh info arrives.
+        self._sync_position_change()
         for eng_event in self._client.poll_events():
-            self._controller.process_event(eng_event)
-            if isinstance(eng_event, InfoUpdate):
+            accepted = self._controller.process_event(eng_event)
+            # An engine bestmove (AI vs AI / Human vs AI) advances the position
+            # inside the controller — re-check so the next InfoUpdate in this
+            # same batch lands on a freshly-reset panel.
+            self._sync_position_change()
+            # `accepted == False` means the controller dropped this InfoUpdate
+            # as stale (predates the latest position change). Skip the panel
+            # and arrow updates too so we don't render numbers from the prior
+            # position on the rebuilt board.
+            if accepted and isinstance(eng_event, InfoUpdate):
                 self._analysis_panel.update_info(eng_event)
                 self._update_arrows()
+
+    def _sync_position_change(self) -> None:
+        """Reset per-position UI state when the move history length changed.
+
+        Covers human moves, engine moves, undo, and new_game from one place.
+        The analysis panel's sticky mate snapshot is cleared here so it never
+        bleeds onto a different position.
+        """
+        n = len(self._controller.state.move_history)
+        if n != self._last_move_count:
+            self._last_move_count = n
+            self._analysis_panel.reset()
 
     def render(self) -> None:
         theme = self.theme

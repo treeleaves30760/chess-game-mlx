@@ -46,6 +46,11 @@ class AnalysisPanel:
         self._depth: int = 0
         self._nodes: int = 0
         self._nps: int = 0
+        # Sticky mate snapshot: keeps the banner visible across short windows
+        # where the engine flickers back to `score cp` because of a transient
+        # |q| < 0.99 read (e.g. concurrent backprop race in the C++ MCTS).
+        # Cleared only by reset() — i.e. on new game / undo / move played.
+        self._sticky_mate: InfoUpdate | None = None
 
         self._fonts: dict[str, pygame.font.Font] = {}
 
@@ -55,6 +60,13 @@ class AnalysisPanel:
 
     def update_info(self, info: InfoUpdate) -> None:
         """Ingest a new InfoUpdate from the engine."""
+        # A real search line always carries a PV. A PV-less update (e.g. a
+        # mis-parsed "info string ..." line, or a malformed engine emit) has no
+        # move to show and would only blank a real top-move slot if we stored
+        # it. Drop it — defense in depth alongside the parser's info-string
+        # guard so the #1 move never silently vanishes from the panel.
+        if not info.pv:
+            return
         # Replace entry for this multipv index
         idx = info.multipv - 1
         while len(self._infos) <= idx:
@@ -62,18 +74,35 @@ class AnalysisPanel:
         self._infos[idx] = info
 
         if info.multipv == 1:
-            self._score_cp = info.score_cp
             self._depth = info.depth
             self._nodes = info.nodes
             self._nps = info.nps
+            # Latch onto a mate observation so the banner survives a brief
+            # window of "score cp" lines from a racing MCTS reporter. We
+            # keep the previous _score_cp (and stale eval bar) rather than
+            # overwriting it with 0 from a `score mate N` line, which would
+            # otherwise yank the eval bar to centre during the mate display.
+            if self._is_mate_info(info):
+                self._sticky_mate = info
+            else:
+                self._score_cp = info.score_cp
+
+    def _is_mate_info(self, info: InfoUpdate) -> bool:
+        """True if this info line represents a forced mate.
+
+        Either explicit `score mate N` or the saturated `score cp` fallback
+        for older engine builds (|cp| >= 29000).
+        """
+        return info.score_mate is not None or abs(info.score_cp) >= 29000
 
     def reset(self) -> None:
-        """Clear all state (new game)."""
+        """Clear all state (new game / undo / move played)."""
         self._infos = []
         self._score_cp = 0
         self._depth = 0
         self._nodes = 0
         self._nps = 0
+        self._sticky_mate = None
 
     # -----------------------------------------------------------------------
     # Rendering
@@ -102,10 +131,20 @@ class AnalysisPanel:
         # Background
         pygame.draw.rect(self.surface, self.theme.eval_bar_black, r)
 
-        # White portion (from bottom, fraction based on score)
-        cp = max(-EVAL_BAR_MAX_CP, min(EVAL_BAR_MAX_CP, self._score_cp))
-        # Map cp to [0.0, 1.0] — 0 cp → 0.5, positive → more white
-        fraction = 0.5 + 0.5 * math.tanh(cp / 400.0)
+        mate = self._detect_mate()
+        if mate is not None:
+            # Peg the bar to whichever side is winning the mate, so the user
+            # can't read a contradictory eval bar (centre/equal) while the
+            # banner says "MATE in N".
+            _, winning = mate
+            fraction = 1.0 if winning else 0.0
+            label_text = f"+M{mate[0]}" if winning else f"-M{mate[0]}"
+        else:
+            cp = max(-EVAL_BAR_MAX_CP, min(EVAL_BAR_MAX_CP, self._score_cp))
+            # Map cp to [0.0, 1.0] — 0 cp → 0.5, positive → more white
+            fraction = 0.5 + 0.5 * math.tanh(cp / 400.0)
+            sign = "+" if self._score_cp >= 0 else ""
+            label_text = f"{sign}{self._score_cp / 100:.2f}"
         white_h = int(r.height * fraction)
         white_rect = pygame.Rect(r.left, r.bottom - white_h, r.width, white_h)
         pygame.draw.rect(self.surface, self.theme.eval_bar_white, white_rect)
@@ -122,9 +161,7 @@ class AnalysisPanel:
 
         # Score label
         font = self._font(FONT_TINY)
-        sign = "+" if self._score_cp >= 0 else ""
-        label = f"{sign}{self._score_cp / 100:.2f}"
-        label_surf = font.render(label, True, self.theme.text_primary)
+        label_surf = font.render(label_text, True, self.theme.text_primary)
         # Rotate 90 degrees and draw
         label_rot = pygame.transform.rotate(label_surf, 90)
         cx = r.left + r.width // 2
@@ -168,10 +205,20 @@ class AnalysisPanel:
         header_font = self._font(FONT_MEDIUM, bold=True)
         small_font = self._font(FONT_SMALL)
 
-        # Eval score
-        sign = "+" if self._score_cp >= 0 else ""
-        eval_str = f"Eval  {sign}{self._score_cp / 100:.2f}"
-        color = self.theme.text_accent if self._score_cp >= 0 else self.theme.text_error
+        # Eval score — show "Mate ±N" form when a mate is locked in, so the
+        # number agrees with the mate banner instead of falling to "+0.00"
+        # whenever a `score mate N` line (cp=0) lands on top.
+        mate = self._detect_mate()
+        if mate is not None:
+            n, winning = mate
+            eval_str = f"Eval  {'+' if winning else '-'}M{n}"
+            color = (self.theme.text_accent if winning
+                     else self.theme.text_error)
+        else:
+            sign = "+" if self._score_cp >= 0 else ""
+            eval_str = f"Eval  {sign}{self._score_cp / 100:.2f}"
+            color = (self.theme.text_accent if self._score_cp >= 0
+                     else self.theme.text_error)
         eval_surf = header_font.render(eval_str, True, color)
         self.surface.blit(eval_surf, (x, y))
         y += eval_surf.get_height() + 4
@@ -250,18 +297,24 @@ class AnalysisPanel:
 
         Engines may emit either ``score mate N`` (newer) or saturate ``score cp``
         near ±32000 (older). Both paths are handled here.
+
+        Prefers the sticky snapshot when present so the banner stays visible
+        across brief non-mate flickers from a racing MCTS reporter; the sticky
+        snapshot is cleared in reset() when the position is known to change.
         """
-        if not self._infos:
+        src = self._sticky_mate
+        if src is None and self._infos:
+            src = self._infos[0]
+        if src is None:
             return None
-        top = self._infos[0]
-        if top.score_mate is not None:
-            n = abs(top.score_mate)
-            return (max(1, n), top.score_mate > 0)
-        if top.score_cp >= 29000:
-            n = (32000 - top.score_cp) // 2 + 1
+        if src.score_mate is not None:
+            n = abs(src.score_mate)
+            return (max(1, n), src.score_mate > 0)
+        if src.score_cp >= 29000:
+            n = (32000 - src.score_cp) // 2 + 1
             return (max(1, n), True)
-        if top.score_cp <= -29000:
-            n = (32000 + top.score_cp) // 2 + 1
+        if src.score_cp <= -29000:
+            n = (32000 + src.score_cp) // 2 + 1
             return (max(1, n), False)
         return None
 

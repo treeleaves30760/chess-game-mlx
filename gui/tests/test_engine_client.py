@@ -112,3 +112,24 @@ def test_parse_info_line_mate() -> None:
     assert info.pv == ["e2e4"]
 
 
+def test_parse_info_string_is_ignored() -> None:
+    """`info string ...` is free-form engine text, not a search line.
+
+    Regression: the engine emits `info string batcher ...` right before every
+    bestmove. Parsing it as a search line produced InfoUpdate(multipv=1, pv=[],
+    score_cp=0), which overwrote the real top-1 move in the analysis panel (so
+    the #1 move vanished, leaving only "2." and "3.") and zeroed the eval.
+    """
+    from gui.engine_client import parse_info_line
+
+    assert parse_info_line("info string batcher batches=20 requests=289 avg_batch=14.4") is None
+    assert parse_info_line(
+        "info string setoption NN_Weights = foo (requires engine restart)"
+    ) is None
+    # A genuine search line that merely *contains* the word "string" later on is
+    # unaffected (only the immediate "info string" prefix is special).
+    info = parse_info_line("info depth 4 multipv 1 score cp 12 pv e2e4")
+    assert info is not None
+    assert info.pv == ["e2e4"]
+
+

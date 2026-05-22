@@ -99,6 +99,14 @@ class GameController:
         self.state = ControllerState(mode=mode, my_side=side)
         self._multi_pv = 3
         self._latest_info: dict[int, InfoUpdate] = {}
+        # Position-change barrier. Every `isready` we send bumps this counter;
+        # every `readyok` we receive decrements it. InfoUpdates that arrive
+        # while the counter > 0 belong to a search the engine started *before*
+        # the most recent position change (e.g. the final info+bestmove from a
+        # search the user just interrupted with undo / a new move) and would
+        # otherwise repopulate the analysis panel with stale data for a
+        # position that no longer exists. We drop them.
+        self._isready_outstanding = 0
 
     # -----------------------------------------------------------------------
     # Board construction / move formatting
@@ -141,10 +149,21 @@ class GameController:
         """Send UCI/USI init sequence. Call once after engine is started."""
         protocol = "uci" if self._game == "chess" else "usi"
         self._client.send_uci(protocol)
-        self._client.send_uci("isready")
+        self._send_isready()
 
         if self.state.mode in (GameMode.ANALYSIS, GameMode.SINGLE_SIDE, GameMode.AI_VS_AI):
             self._client.send_uci(f"setoption name MultiPV value {self._multi_pv}")
+
+    def _send_isready(self) -> None:
+        """Send `isready` and arm the post-position-change barrier.
+
+        Pairs with the matching `readyok` decrement in process_event so the
+        engine's reply order acts as a sync point — every InfoUpdate emitted
+        *before* this readyok was generated under the prior position and is
+        discarded by the caller of process_event.
+        """
+        self._client.send_uci("isready")
+        self._isready_outstanding += 1
 
     def new_game(self) -> None:
         """Reset board and engine state."""
@@ -186,6 +205,11 @@ class GameController:
 
     def _send_position(self) -> None:
         self._client.send_uci(self._position_cmd())
+        # Arm the stale-info barrier — the engine may still have a search
+        # thread finishing up from before this position change, and its
+        # final info / bestmove must not be allowed to repopulate the UI
+        # state we just rebuilt for the new position.
+        self._send_isready()
 
     # -----------------------------------------------------------------------
     # Move input
@@ -398,8 +422,15 @@ class GameController:
     # Engine event processing
     # -----------------------------------------------------------------------
 
-    def process_event(self, event: EngineEvent) -> None:
-        """Dispatch an engine event to the appropriate handler."""
+    def process_event(self, event: EngineEvent) -> bool:
+        """Dispatch an engine event to the appropriate handler.
+
+        Returns False when the event was a stale InfoUpdate that belongs to a
+        search the engine started before the most recent position change —
+        callers should propagate that decision (e.g. skip panel updates) so
+        the UI doesn't render numbers for a position that no longer exists.
+        For every other event type, returns True.
+        """
         match event:
             case UciOkEvent(engine_name=name):
                 self.state.engine_name = name or "Engine"
@@ -408,8 +439,12 @@ class GameController:
 
             case ReadyOkEvent():
                 self.state.is_engine_ready = True
+                if self._isready_outstanding > 0:
+                    self._isready_outstanding -= 1
 
             case InfoUpdate() as info:
+                if self._isready_outstanding > 0:
+                    return False  # stale, predates the latest position change
                 self._latest_info[info.multipv] = info
                 if info.multipv == 1:
                     self._maybe_set_mate_status(info)
@@ -422,6 +457,8 @@ class GameController:
 
             case _:
                 pass
+
+        return True
 
     def _handle_bestmove(self, move_str: str) -> None:
         # Defense in depth: if the latest top-1 was a forced mate but the

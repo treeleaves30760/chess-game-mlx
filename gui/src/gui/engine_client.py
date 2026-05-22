@@ -133,6 +133,16 @@ def parse_info_line(line: str) -> InfoUpdate | None:  # noqa: PLR0912, PLR0915
     if not tokens or tokens[0] != "info":
         return None
 
+    # "info string <text>" is free-form engine output per the UCI spec, not a
+    # search-info line. Parsing it as one yields a bogus InfoUpdate with
+    # multipv=1, score_cp=0 and an empty PV — and the engine emits one such line
+    # ("info string batcher ...") right before every bestmove. That bogus update
+    # overwrites the real top-1 entry in the analysis panel (so the #1 move
+    # vanishes, leaving only "2." and "3.") and yanks the eval score to 0.0.
+    # Ignore these lines entirely.
+    if len(tokens) >= 2 and tokens[1] == "string":
+        return None
+
     update = InfoUpdate()
     i = 1
     while i < len(tokens):
