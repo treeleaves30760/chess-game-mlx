@@ -31,7 +31,67 @@ import mlx.optimizers as optim
 import numpy as np
 
 from training.losses import combined_loss
-from training.models.transformer import ChessShogiTransformer
+from training.models.transformer import (
+    CHESS_FEAT_DIM,
+    CHESS_NUM_MOVES,
+    CHESS_SEQ_LEN,
+    SHOGI_FEAT_DIM,
+    SHOGI_NUM_MOVES,
+    SHOGI_SEQ_LEN,
+    ChessShogiTransformer,
+)
+
+
+def _arch_metadata(model: ChessShogiTransformer, game: str) -> dict:
+    """Return architecture descriptor dict suitable for the .json sidecar.
+
+    The C++ MlxBackend reads `feat_dim`, `seq_len`, and `num_moves` from
+    this dict to size input/output tensors and to validate against the
+    engine's expected dims.  Per-step checkpoints written without these
+    fields cannot be loaded by the engine.
+
+    `game` should be one of "chess", "shogi", or "both".  For "both" we
+    record both games' shapes; the C++ side currently picks chess by
+    default when game=="both" — callers wanting to serve shogi should
+    re-export with game="shogi".
+    """
+    if game == "chess":
+        seq_len, feat_dim, num_moves = CHESS_SEQ_LEN, CHESS_FEAT_DIM, CHESS_NUM_MOVES
+    elif game == "shogi":
+        seq_len, feat_dim, num_moves = SHOGI_SEQ_LEN, SHOGI_FEAT_DIM, SHOGI_NUM_MOVES
+    else:
+        # game == "both": fall back to chess defaults; record both for
+        # diagnostics so the engine can flag the mismatch loudly.
+        seq_len, feat_dim, num_moves = CHESS_SEQ_LEN, CHESS_FEAT_DIM, CHESS_NUM_MOVES
+
+    # Infer ffn_dim from the first transformer layer's fc1 weight shape.
+    try:
+        first_layer = (model.chess_layers if game != "shogi" else model.shogi_layers)[0]
+        ffn_dim = int(first_layer.ffn.fc1.weight.shape[0])
+    except Exception:
+        ffn_dim = 0  # 0 signals "unknown" to the engine without breaking validation
+
+    out = {
+        "version":  "1.0",
+        "game":     game,
+        "n_layers": int(model.n_layers),
+        "d_model":  int(model.d_model),
+        "n_heads":  int(model.n_heads),
+        "ffn_dim":  ffn_dim,
+        "seq_len":  int(seq_len),
+        "feat_dim": int(feat_dim),
+        "num_moves": int(num_moves),
+        "encoding_spec_version": "v1.0",
+    }
+    if game == "both":
+        # Record per-game shapes so the engine can pick the right one.
+        out["chess_seq_len"]   = int(CHESS_SEQ_LEN)
+        out["chess_feat_dim"]  = int(CHESS_FEAT_DIM)
+        out["chess_num_moves"] = int(CHESS_NUM_MOVES)
+        out["shogi_seq_len"]   = int(SHOGI_SEQ_LEN)
+        out["shogi_feat_dim"]  = int(SHOGI_FEAT_DIM)
+        out["shogi_num_moves"] = int(SHOGI_NUM_MOVES)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -247,7 +307,14 @@ class SupervisedTrainer:
     # ------------------------------------------------------------------
 
     def _save_checkpoint(self, suffix: str = "") -> Path:
-        """Save model weights and optimiser state to checkpoint directory."""
+        """Save model weights and optimiser state to checkpoint directory.
+
+        The sidecar `.json` carries the model's architecture (`feat_dim`,
+        `num_moves`, `seq_len`, ...) so the C++ MlxBackend can size its
+        input/output tensors and reject mismatched loads.  Without these
+        fields the backend falls back to chess defaults and silently
+        reads past the end of the input buffer for shogi models.
+        """
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         tag = f"step_{self.step:07d}{suffix}"
         weights_path = self.checkpoint_dir / f"{tag}.safetensors"
@@ -256,12 +323,11 @@ class SupervisedTrainer:
         # Save weights
         self.model.save_weights(str(weights_path))
 
-        # Save metadata
-        meta = {
-            "step": self.step,
-            "game": self.game,
-            "loss_history": self.history[-100:],  # last 100 steps
-        }
+        # Save metadata: architecture fields first (engine-critical), then
+        # training-state fields for human inspection.
+        meta = _arch_metadata(self.model, self.game)
+        meta["step"] = self.step
+        meta["loss_history"] = self.history[-100:]
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
@@ -274,6 +340,14 @@ class SupervisedTrainer:
         out = Path(path)
         out.parent.mkdir(parents=True, exist_ok=True)
         self.model.save_weights(str(out))
+        # Mirror the per-step sidecar format so the engine can load
+        # arbitrary save_final outputs.
+        meta_path = out.with_suffix(".json")
+        meta = _arch_metadata(self.model, self.game)
+        meta["step"] = self.step
+        meta["loss_history"] = self.history[-100:]
+        with open(meta_path, "w") as f:
+            json.dump(meta, f, indent=2)
         return out
 
     # ------------------------------------------------------------------
@@ -527,7 +601,10 @@ class JointSupervisedTrainer:
     # ------------------------------------------------------------------
 
     def _save_checkpoint(self, suffix: str = "") -> Path:
-        """Save model weights + metadata to the checkpoint directory."""
+        """Save model weights + metadata to the checkpoint directory.
+
+        See `SupervisedTrainer._save_checkpoint` for the sidecar contract.
+        """
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         tag = f"joint_step_{self.step:07d}{suffix}"
         weights_path = self.checkpoint_dir / f"{tag}.safetensors"
@@ -535,11 +612,9 @@ class JointSupervisedTrainer:
 
         self.model.save_weights(str(weights_path))
 
-        meta = {
-            "step": self.step,
-            "game": "both",          # signals engine: model serves both games
-            "loss_history": self.history[-100:],
-        }
+        meta = _arch_metadata(self.model, "both")
+        meta["step"] = self.step
+        meta["loss_history"] = self.history[-100:]
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
@@ -553,9 +628,10 @@ class JointSupervisedTrainer:
         out.parent.mkdir(parents=True, exist_ok=True)
         self.model.save_weights(str(out))
 
-        # Write sidecar JSON recording game="both"
         meta_path = out.with_suffix(".json")
-        meta = {"step": self.step, "game": "both", "loss_history": self.history[-100:]}
+        meta = _arch_metadata(self.model, "both")
+        meta["step"] = self.step
+        meta["loss_history"] = self.history[-100:]
         with open(meta_path, "w") as f:
             json.dump(meta, f, indent=2)
 
