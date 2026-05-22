@@ -28,6 +28,10 @@ if(TARGET chess_mlx_chess)
     add_executable(test_lc0_encoding test_lc0_encoding.cpp)
     target_link_libraries(test_lc0_encoding PRIVATE chess_mlx_chess GTest::gtest_main)
     gtest_discover_tests(test_lc0_encoding)
+
+    add_executable(test_chess_compact_1858 test_chess_compact_1858.cpp)
+    target_link_libraries(test_chess_compact_1858 PRIVATE chess_mlx_chess GTest::gtest_main)
+    gtest_discover_tests(test_chess_compact_1858)
 endif()
 
 # --------------- Shogi tests ---------------

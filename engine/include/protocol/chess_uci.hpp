@@ -8,6 +8,7 @@
 #pragma once
 
 #include "chess/chess_traits.hpp"
+#include "chess/chess_hybrid_traits.hpp"
 #include "chess/lc0_chess_traits.hpp"
 #include "chess/uci.hpp"
 #include "nn/backend.hpp"
@@ -87,10 +88,46 @@ struct Lc0ChessUciTraits {
 };
 
 // ---------------------------------------------------------------------------
+// ChessHybridUciTraits — hooks for chess, native 19-plane encoder + LC0
+// compact 1858-slot policy.  This is the path every MLX-trained chess
+// checkpoint in this repo uses; it's the default for `--weights` loads.
+// ---------------------------------------------------------------------------
+struct ChessHybridUciTraits {
+    using Traits   = chess_mlx::chess::ChessHybridTraits;
+    using Position = Traits::Position;
+    using Move     = Traits::Move;
+
+    static std::string engine_id_name() { return "chess_mlx_hybrid_engine"; }
+    static std::string init_string()    { return "uci"; }
+    static std::string ok_string()      { return "uciok"; }
+    static std::string newgame_keyword(){ return "ucinewgame"; }
+
+    static Position start_position()    { return Position{}; }
+
+    static Position parse_position_command(std::string_view line) {
+        if (line.substr(0, 9) == "position ") line.remove_prefix(9);
+        return chess_mlx::chess::parse_position_command(line);
+    }
+
+    static std::string move_to_string(const Move& m) {
+        return chess_mlx::chess::move_to_uci(m);
+    }
+
+    static bool stm_is_white(const Position& p) {
+        return p.board.sideToMove() == ::chess::Color::WHITE;
+    }
+
+    static Move parse_move(const Position& pos, const std::string& uci_str) {
+        return chess_mlx::chess::uci_to_move(pos, uci_str);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Convenience wrappers.
 // ---------------------------------------------------------------------------
 
-// Standard (19-plane / 4672-slot) version.
+// Standard (19-plane / 4672-slot) version — kept for completeness; no shipped
+// checkpoint actually uses this output space.
 inline int run_uci_loop_with_backend(std::shared_ptr<nn::NNBackend> backend,
                                       int threads = 1,
                                       int multipv = 1) {
@@ -104,7 +141,7 @@ inline int run_uci_loop_with_backend(std::shared_ptr<nn::NNBackend> backend,
     return loop.run();
 }
 
-// LC0 (112-plane / 1858-slot) version.
+// LC0 (112-plane / stm-relative 1858-slot) version — BT4 ONNX path.
 inline int run_lc0_uci_loop_with_backend(std::shared_ptr<nn::NNBackend> backend,
                                           int threads = 1,
                                           int multipv = 1) {
@@ -113,6 +150,21 @@ inline int run_lc0_uci_loop_with_backend(std::shared_ptr<nn::NNBackend> backend,
     cfg.threads     = std::max(1, threads);
     cfg.multipv     = std::max(1, multipv);
     cfg.input_size  = 64 * 112;   // 7168
+    cfg.policy_size = 1858;
+    Loop loop(backend, cfg);
+    return loop.run();
+}
+
+// Hybrid (19-plane / color-absolute compact 1858-slot) version — the
+// canonical path for MLX safetensors checkpoints.
+inline int run_hybrid_uci_loop_with_backend(std::shared_ptr<nn::NNBackend> backend,
+                                             int threads = 1,
+                                             int multipv = 1) {
+    using Loop = UciLoop<ChessHybridUciTraits>;
+    typename Loop::MCTS::Config cfg;
+    cfg.threads     = std::max(1, threads);
+    cfg.multipv     = std::max(1, multipv);
+    cfg.input_size  = 64 * 19;    // 1216
     cfg.policy_size = 1858;
     Loop loop(backend, cfg);
     return loop.run();
